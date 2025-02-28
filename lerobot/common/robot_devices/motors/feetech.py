@@ -29,8 +29,8 @@ UPPER_BOUND_DEGREE = 270
 # their nominal range is [0, 100] %. For instance, for Aloha gripper, 0% is fully
 # closed, and 100% is fully open. To account for slight calibration issue, we allow up to
 # [-10, 110] until an error is raised.
-LOWER_BOUND_LINEAR = -10
-UPPER_BOUND_LINEAR = 110
+LOWER_BOUND_LINEAR = -50
+UPPER_BOUND_LINEAR = 150
 
 HALF_TURN_DEGREE = 180
 

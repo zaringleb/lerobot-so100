@@ -78,7 +78,7 @@ class RecordControlConfig(ControlConfig):
     # Not enough threads might cause low camera fps.
     num_image_writer_threads_per_camera: int = 4
     # Display all cameras on screen
-    display_cameras: bool = True
+    display_cameras: bool = False
     # Use vocal synthesis to read events.
     play_sounds: bool = True
     # Resume recording on an existing dataset.
@@ -133,6 +133,15 @@ class ReplayControlConfig(ControlConfig):
     # TODO(rcadene, aliberts): remove local_files_only when refactor with dataset as argument
     # Use local files only. By default, this script will try to fetch the dataset from the hub if it exists.
     local_files_only: bool = False
+
+
+@ControlConfig.register_subclass("move")
+@dataclass
+class MoveControlConfig(ControlConfig):
+    # Limit the frames per second. By default, uses the dataset fps.
+    fps: int | None = None
+    # Use vocal synthesis to read events.
+    play_sounds: bool = True
 
 
 @dataclass
