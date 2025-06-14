@@ -316,6 +316,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
     listener, events = init_keyboard_listener()
 
     for recorded_episodes in range(cfg.dataset.num_episodes):
+        current_task = input("Enter the task: ")
         log_say(f"Recording episode {dataset.num_episodes}", cfg.play_sounds)
         record_loop(
             robot=robot,
@@ -325,7 +326,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
             policy=policy,
             dataset=dataset,
             control_time_s=cfg.dataset.episode_time_s,
-            single_task=cfg.dataset.single_task,
+            single_task=current_task,
             display_data=cfg.display_data,
         )
 
@@ -344,8 +345,8 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                 events=events,
                 fps=cfg.dataset.fps,
                 teleop=teleop,
-                control_time_s=cfg.dataset.reset_time_s,
-                single_task=cfg.dataset.single_task,
+                control_time_s=3,
+                single_task=current_task,
                 display_data=cfg.display_data,
             )
 
