@@ -15,8 +15,8 @@ from transformers import AutoModelForImageTextToText, AutoProcessor
 from transformers.models.smolvlm.image_processing_smolvlm_fast import SmolVLMImageProcessorFast
 
 from lerobot.policies.pretrained import PreTrainedPolicy
-from lerobot.policies.vla0.configuration_vla0 import VLA0Config
-from lerobot.policies.vla0.monkey_patch import patch_SmolVLMProcessor, patch_SmolVLM_amp
+from lerobot.policies.vla0_smol.configuration_vla0_smol import VLA0SmolConfig
+from lerobot.policies.vla0_smol.monkey_patch import patch_SmolVLMProcessor, patch_SmolVLM_amp
 from lerobot.utils.constants import ACTION, OBS_STATE
 
 
@@ -29,15 +29,15 @@ PRECISION = {
 EPS = 1e-6
 
 
-class VLA0Policy(PreTrainedPolicy):
+class VLA0SmolPolicy(PreTrainedPolicy):
     """Wrapper class around VLA0 model to train and run inference within LeRobot."""
 
-    config_class = VLA0Config
+    config_class = VLA0SmolConfig
     name = "vla0"
 
     def __init__(
         self,
-        config: VLA0Config,
+        config: VLA0SmolConfig,
         dataset_stats: dict[str, dict[str, Tensor]] | None = None,
     ):
         """
@@ -180,7 +180,7 @@ class VLA0TemporalEnsembler:
 
 
 class VLA0(nn.Module):
-    def __init__(self, config: VLA0Config):
+    def __init__(self, config: VLA0SmolConfig):
         super().__init__()
         self.config = config
 

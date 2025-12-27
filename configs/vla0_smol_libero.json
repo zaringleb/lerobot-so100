@@ -1,24 +1,20 @@
 {
     "dataset": {
-        "repo_id": "lerobot/pusht"
+        "repo_id": "HuggingFaceVLA/libero"
     },
     "env": {
-        "type": "pusht",
-        "task": "PushT-v0",
-        "obs_type": "pixels_agent_pos",
-        "render_mode": "rgb_array"
+        "type": "libero",
+        "task": "libero_object"
     },
     "policy": {
-        "type": "vla0",
+        "type": "vla0_smol",
         "vlm_checkpoint": "HuggingFaceTB/SmolVLM2-500M-Video-Instruct",
         "n_obs_steps": 1,
         "device": "cuda",
-        "use_amp": true,
-        "amp_dtype": "bf16",
         "push_to_hub": false,
-        "chunk_size": 10,
-        "n_action_steps": 5,
-        "optimizer_lr": 0.00005,
+        "chunk_size": 8,
+        "n_action_steps": 8,
+        "optimizer_lr": 5e-5,
         "optimizer_betas": [
             0.9,
             0.95
@@ -26,30 +22,31 @@
         "optimizer_eps": 1e-08,
         "optimizer_weight_decay": 0.01,
         "scheduler_warmup_steps": 1000,
-        "scheduler_decay_steps": 30000,
+        "scheduler_decay_steps": 100000,
         "scheduler_decay_lr": 5e-06,
         "precision": "float32",
         "freeze_vision_encoder": false,
         "do_image_splitting": false,
         "drop_n_last_frames": 1,
         "grad_clip_norm": 1,
-        "crop_shape": [84, 84],
-        "relative_actions": true,
-        "use_state": true,
-        "action_mask_aug_per": 0.15,
-        "action_mask_skip_per": 0.1
+        "crop_shape": [
+            230,
+            230
+        ],
+        "relative_actions": false,
+        "use_state": true
     },
-    "num_workers": 4,
+    "num_workers": 8,
     "batch_size": 16,
-    "steps": 30000,
-    "eval_freq": 3000,
-    "log_freq": 100,
+    "steps": 100000,
+    "eval_freq": 20000,
+    "log_freq": 200,
     "save_checkpoint": true,
     "save_freq": 10000,
     "profile_step_num": -1,
     "eval": {
-        "n_episodes": 64,
-        "batch_size": 64
+        "n_episodes": 16,
+        "batch_size": 16
     },
     "wandb": {
         "enable": true,

@@ -35,7 +35,7 @@ from lerobot.policies.groot.configuration_groot import GrootConfig
 from lerobot.policies.pi0.configuration_pi0 import PI0Config
 from lerobot.policies.pi05.configuration_pi05 import PI05Config
 from lerobot.policies.smolandfast.configuration_smolandfast import SMOLANDFASTConfig
-from lerobot.policies.vla0.configuration_vla0 import VLA0Config
+from lerobot.policies.vla0_smol.configuration_vla0_smol import VLA0SmolConfig
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.policies.sac.configuration_sac import SACConfig
 from lerobot.policies.sac.reward_model.configuration_classifier import RewardClassifierConfig
@@ -119,10 +119,10 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
         from lerobot.policies.smolandfast.modeling_smolandfast import SMOLANDFASTPolicy
 
         return SMOLANDFASTPolicy
-    elif name == "vla0":
-        from lerobot.policies.vla0.modeling_vla0 import VLA0Policy
+    elif name == "vla0_smol":
+        from lerobot.policies.vla0_smol.modeling_vla0_smol import VLA0SmolPolicy
 
-        return VLA0Policy
+        return VLA0SmolPolicy
     else:
         try:
             return _get_policy_cls_from_policy_name(name=name)
@@ -173,8 +173,8 @@ def make_policy_config(policy_type: str, **kwargs) -> PreTrainedConfig:
         return XVLAConfig(**kwargs)
     elif policy_type == "smolandfast":
         return SMOLANDFASTConfig(**kwargs)
-    elif policy_type == "vla0":
-        return VLA0Config(**kwargs)
+    elif policy_type == "vla0_smol":
+        return VLA0SmolConfig(**kwargs)
     else:
         try:
             config_cls = PreTrainedConfig.get_choice_class(policy_type)
@@ -358,11 +358,11 @@ def make_pre_post_processors(
             config=policy_cfg,
             dataset_stats=kwargs.get("dataset_stats"),
         )
-    
-    elif isinstance(policy_cfg, VLA0Config):
-        from lerobot.policies.vla0.processor_vla0 import make_vla0_pre_post_processors
 
-        processors = make_vla0_pre_post_processors(
+    elif isinstance(policy_cfg, VLA0SmolConfig):
+        from lerobot.policies.vla0_smol.processor_vla0_smol import make_vla0_smol_pre_post_processors
+
+        processors = make_vla0_smol_pre_post_processors(
             config=policy_cfg,
             dataset_stats=kwargs.get("dataset_stats"),
         )

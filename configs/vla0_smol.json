@@ -1,17 +1,20 @@
 {
     "dataset": {
-        "repo_id": "lerobot/aloha_sim_transfer_cube_human"
+        "repo_id": "lerobot/pusht"
     },
     "env": {
-        "type": "aloha",
-        "task": "AlohaTransferCube-v0"
+        "type": "pusht",
+        "task": "PushT-v0",
+        "obs_type": "pixels_agent_pos",
+        "render_mode": "rgb_array"
     },
     "policy": {
-        "type": "vla0",
-        "vlm_checkpoint": "HuggingFaceTB/SmolVLM2-256M-Video-Instruct",
+        "type": "vla0_smol",
+        "vlm_checkpoint": "HuggingFaceTB/SmolVLM2-500M-Video-Instruct",
         "n_obs_steps": 1,
         "device": "cuda",
-        "use_amp": false,
+        "use_amp": true,
+        "amp_dtype": "bf16",
         "push_to_hub": false,
         "chunk_size": 10,
         "n_action_steps": 5,
@@ -30,9 +33,11 @@
         "do_image_splitting": false,
         "drop_n_last_frames": 1,
         "grad_clip_norm": 1,
-        "crop_shape": [460, 620],
+        "crop_shape": [84, 84],
         "relative_actions": true,
-        "use_state": true
+        "use_state": true,
+        "action_mask_aug_per": 0.15,
+        "action_mask_skip_per": 0.1
     },
     "num_workers": 4,
     "batch_size": 16,
@@ -47,7 +52,7 @@
         "batch_size": 64
     },
     "wandb": {
-        "enable": true,
+        "enable": false,
         "project": "lerobot"
     }
 }

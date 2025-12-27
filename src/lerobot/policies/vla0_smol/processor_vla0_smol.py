@@ -4,7 +4,7 @@ from typing import Any
 
 import torch
 
-from lerobot.policies.vla0.configuration_vla0 import VLA0Config
+from lerobot.policies.vla0_smol.configuration_vla0_smol import VLA0SmolConfig
 from lerobot.processor import (
     AddBatchDimensionProcessorStep,
     DeviceProcessorStep,
@@ -18,15 +18,15 @@ from lerobot.processor.converters import policy_action_to_transition, transition
 from lerobot.utils.constants import POLICY_POSTPROCESSOR_DEFAULT_NAME, POLICY_PREPROCESSOR_DEFAULT_NAME
 
 
-def make_vla0_pre_post_processors(
-    config: VLA0Config,
+def make_vla0_smol_pre_post_processors(
+    config: VLA0SmolConfig,
     dataset_stats: dict[str, dict[str, torch.Tensor]] | None = None,
 ) -> tuple[
     PolicyProcessorPipeline[dict[str, Any], dict[str, Any]],
     PolicyProcessorPipeline[PolicyAction, PolicyAction],
 ]:
     """
-    Constructs pre-processor and post-processor pipelines for the VLA0 policy.
+    Constructs pre-processor and post-processor pipelines for the VLA0-Smol policy.
 
     The pre-processing pipeline prepares input data for the model by:
     1. Renaming features to match pretrained configurations.
@@ -39,7 +39,7 @@ def make_vla0_pre_post_processors(
     2. Unnormalizing the output features to their original scale.
 
     Args:
-        config: The configuration object for the VLA0 policy.
+        config: The configuration object for the VLA0-Smol policy.
         dataset_stats: A dictionary of statistics for normalization.
         preprocessor_kwargs: Additional arguments for the pre-processor pipeline.
         postprocessor_kwargs: Additional arguments for the post-processor pipeline.

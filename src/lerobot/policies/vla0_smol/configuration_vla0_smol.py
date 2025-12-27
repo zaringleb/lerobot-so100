@@ -8,9 +8,9 @@ from lerobot.optim.schedulers import (
 )
 
 
-@PreTrainedConfig.register_subclass("vla0")
+@PreTrainedConfig.register_subclass("vla0_smol")
 @dataclass
-class VLA0Config(PreTrainedConfig):
+class VLA0SmolConfig(PreTrainedConfig):
     # Input / output structure.
     n_obs_steps: int = 1
     chunk_size: int = 10
