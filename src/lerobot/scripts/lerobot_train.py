@@ -156,7 +156,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         accelerator = Accelerator(
             mixed_precision=cfg.policy.amp_dtype if cfg.policy.use_amp else None,
             step_scheduler_with_optimizer=False,
-            kwargs_handlers=[ddp_kwargs]
+            kwargs_handlers=[ddp_kwargs],
         )
 
     init_logging(accelerator=accelerator)

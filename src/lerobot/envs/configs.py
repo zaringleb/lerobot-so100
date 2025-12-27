@@ -13,8 +13,9 @@
 # limitations under the License.
 
 import abc
+from collections.abc import Iterable
 from dataclasses import dataclass, field
-from typing import Any, Optional, Iterable
+from typing import Any
 
 import draccus
 
@@ -249,7 +250,7 @@ class LiberoEnv(EnvConfig):
     obs_type: str = "pixels_agent_pos"
     render_mode: str = "rgb_array"
     camera_name: str = "agentview_image,robot0_eye_in_hand_image"
-    task_ids: Optional[Iterable[int]] = None
+    task_ids: Iterable[int] | None = None
     init_states: bool = True
     camera_name_mapping: dict[str, str] | None = None
     observation_height: int = 360
@@ -323,11 +324,7 @@ class LiberoEnv(EnvConfig):
 
     @property
     def gym_kwargs(self) -> dict:
-        return {
-            "obs_type": self.obs_type,
-            "render_mode": self.render_mode,
-            "task_ids": [1]
-        }
+        return {"obs_type": self.obs_type, "render_mode": self.render_mode, "task_ids": [1]}
 
 
 @EnvConfig.register_subclass("metaworld")

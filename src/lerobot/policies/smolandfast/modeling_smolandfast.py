@@ -137,7 +137,9 @@ class SMOLANDFAST(nn.Module):
                 input_size, output_size, bias=False, dtype=self.torch_precision
             )
 
-        self.fast_tokenizer = AutoProcessor.from_pretrained(self.config.fast_tokenizer_path, trust_remote_code=True)
+        self.fast_tokenizer = AutoProcessor.from_pretrained(
+            self.config.fast_tokenizer_path, trust_remote_code=True
+        )
         self.fast_skip_tokens = self.config.fast_skip_tokens
         self.max_input_seq_len = self.config.max_input_seq_len
         self.action_horizon = self.config.chunk_size
@@ -245,8 +247,10 @@ class SMOLANDFAST(nn.Module):
             max_len = max([len(seq) for seq in prefix_tokens])
 
             if max_len > self.max_input_seq_len:
-                print("Sequence length is above the maximum sequence length. "
-                      "This won't break anything, but it may slow down torch.compile.")
+                print(
+                    "Sequence length is above the maximum sequence length. "
+                    "This won't break anything, but it may slow down torch.compile."
+                )
             else:
                 max_len = self.max_input_seq_len
 
@@ -334,7 +338,11 @@ class SMOLANDFAST(nn.Module):
             loss = token_loss.sum() / torch.clamp(loss_mask.sum(), min=1)
 
             # Return loss dictionary
-            loss_dict = {"ce_loss": loss.item(), "loss": loss, "sequence_len": padded_outs["input_ids"].shape[-1]}
+            loss_dict = {
+                "ce_loss": loss.item(),
+                "loss": loss,
+                "sequence_len": padded_outs["input_ids"].shape[-1],
+            }
         return loss_dict
 
     def decode_actions_with_fast(

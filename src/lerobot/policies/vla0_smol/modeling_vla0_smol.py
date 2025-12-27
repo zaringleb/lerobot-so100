@@ -1,12 +1,10 @@
 #!/usr/bin/env python
 
+import logging
+import random
 from collections import deque
 
 import torch
-import random
-import logging
-import itertools
-
 import xgrammar as xgr
 from torch import Tensor, nn
 from torch.profiler import record_function
@@ -16,9 +14,8 @@ from transformers.models.smolvlm.image_processing_smolvlm_fast import SmolVLMIma
 
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.policies.vla0_smol.configuration_vla0_smol import VLA0SmolConfig
-from lerobot.policies.vla0_smol.monkey_patch import patch_SmolVLMProcessor, patch_SmolVLM_amp
+from lerobot.policies.vla0_smol.monkey_patch import patch_SmolVLM_amp, patch_SmolVLMProcessor
 from lerobot.utils.constants import ACTION, OBS_STATE
-
 
 PRECISION = {
     "float16": torch.float16,
@@ -59,7 +56,9 @@ class VLA0SmolPolicy(PreTrainedPolicy):
                 ensemble_prediction_count=self.config.ensemble_size
             )
             logging.info("Ensemble mode for token prediction is enabled.")
-            assert config.n_action_steps == 0, "When ensemble mode is enabled, n_action_steps param should be zero."
+            assert config.n_action_steps == 0, (
+                "When ensemble mode is enabled, n_action_steps param should be zero."
+            )
         else:
             self.temporal_ensembler = None
             logging.info("N actions step mode for token prediction is enabled.")
@@ -68,7 +67,7 @@ class VLA0SmolPolicy(PreTrainedPolicy):
     def reset(self):
         """This should be called whenever the environment is reset."""
         self._action_queue = deque([], maxlen=self.config.n_action_steps)
-        
+
         if self.use_ensembling:
             self.temporal_ensembler.reset()
 
@@ -130,7 +129,7 @@ def build_exact_n_numbers_grammar(n_numbers: int) -> str:
     # Build the exact sequence string: integer space integer space integer ...
     # We construct "integer " * (N-1) + "integer"
     sequence_parts = ["integer"] * n_numbers
-    sequence_rule = 'root ::= space ' + ' space '.join(sequence_parts)
+    sequence_rule = "root ::= space " + " space ".join(sequence_parts)
 
     return base_rules + sequence_rule
 
@@ -139,7 +138,7 @@ class VLA0TemporalEnsembler:
     def __init__(self, ensemble_prediction_count: int) -> None:
         """
         Implements the specific ensembling logic used in VLA0 Libero evaluation.
-        
+
         Args:
             ensemble_prediction_count (int): Corresponds to ensemble_prediction param.
                 This limits how many overlapping schedules are averaged.
@@ -154,7 +153,7 @@ class VLA0TemporalEnsembler:
         """
         Args:
             new_action_chunk: Tensor of shape (batch, horizon, action_dim).
-                Note: This implementation assumes batch_size=1 for simplicity 
+                Note: This implementation assumes batch_size=1 for simplicity
                 as per standard eval loops, but can be adapted.
         """
         self.schedules.append(new_action_chunk)
@@ -221,14 +220,15 @@ class VLA0(nn.Module):
         if self.do_crop:
             self.random_crop_fn = RandomCrop(config.crop_shape)
             self.center_crop_fn = CenterCrop(config.crop_shape)
-        
+
         self.actions_mask_symbol = "<MASK_ACT>"
-        assert self.actions_mask_symbol not in self.processor.tokenizer.get_vocab(), \
+        assert self.actions_mask_symbol not in self.processor.tokenizer.get_vocab(), (
             f"Replace {self.actions_mask_symbol} token with a different token."
+        )
         self.processor.tokenizer.add_tokens([self.actions_mask_symbol], special_tokens=True)
         self.vlm.resize_token_embeddings(len(self.processor.tokenizer), mean_resizing=False)
         self.mask_token_id = self.processor.tokenizer.convert_tokens_to_ids(self.actions_mask_symbol)
-        
+
         tokenizer_info = xgr.TokenizerInfo.from_huggingface(self.processor.tokenizer)
         self.grammar_compiler = xgr.GrammarCompiler(tokenizer_info)
         total_actions = self.config.chunk_size * self.config.action_feature.shape[0]
@@ -275,13 +275,13 @@ class VLA0(nn.Module):
         disc_states_cpu = discretized_states.detach().cpu().numpy()
 
         if actions is None:
-            disc_actions_cpu = [""]*batch_size
+            disc_actions_cpu = [""] * batch_size
         else:
             if self.config.relative_actions:
                 actions = actions - states.unsqueeze(1)
             discretized_actions = torch.bucketize(actions, bins) - 1  # shape: [B, state_dim]
             disc_actions_cpu = discretized_actions.detach().cpu().numpy()
-        
+
         # Build strings in batch
         prompts = []
         for txt, disc_st, act in zip(lang_text, disc_states_cpu, disc_actions_cpu, strict=False):
@@ -321,18 +321,22 @@ class VLA0(nn.Module):
                         ],
                     }
                 )
-            prompts.append(self.processor.apply_chat_template(
-                messages, add_generation_prompt=actions is None))
+            prompts.append(
+                self.processor.apply_chat_template(messages, add_generation_prompt=actions is None)
+            )
 
-        images = {camera_name: list(torch.unbind(camera_images, dim=0)) for camera_name, camera_images in images.items()}
+        images = {
+            camera_name: list(torch.unbind(camera_images, dim=0))
+            for camera_name, camera_images in images.items()
+        }
 
         images_reshaped = []
-        for imgs in zip(*images.values()):
+        for imgs in zip(*images.values(), strict=True):
             if self.do_crop:
                 crop_fn = self.random_crop_fn if self.training else self.center_crop_fn
                 images_reshaped.append([crop_fn(img) for img in imgs])
             else:
-                images_reshaped.append([img for img in imgs])
+                images_reshaped.append(list(imgs))
 
         prefix_out = self.processor(
             images=images_reshaped,
@@ -341,7 +345,7 @@ class VLA0(nn.Module):
             do_rescale=False,
             return_tensors="pt",
             padding=True,
-            padding_side = "right" if actions is not None else "left",
+            padding_side="right" if actions is not None else "left",
         )
         return prefix_out
 
@@ -354,43 +358,44 @@ class VLA0(nn.Module):
     ):
         device = states.device
 
-        prefix_out = self.create_prefix_tokens(states=states, images=images, lang_text=lang_text, actions=actions)
+        prefix_out = self.create_prefix_tokens(
+            states=states, images=images, lang_text=lang_text, actions=actions
+        )
         prefix_out = {k: (v.to(device) if isinstance(v, torch.Tensor) else v) for k, v in prefix_out.items()}
-       
+
         if actions is None:
             loss_mask = None
         else:
             split_mask = torch.where(prefix_out["input_ids"] == self.config.start_actions_token, 1, 0)
             loss_mask = torch.cumsum(split_mask, dim=-1).clamp(0, 1) & prefix_out["attention_mask"]
-            is_masked_token = (prefix_out["input_ids"] == self.mask_token_id)
+            is_masked_token = prefix_out["input_ids"] == self.mask_token_id
             loss_mask = loss_mask & (~is_masked_token)
 
         return prefix_out, loss_mask
 
     def prepare_images(self, batch: torch.Tensor):
-            """Preprocess LeRobot batch into inputs"""
-            images = {}
-            present_img_keys = [key for key in self.image_keys if key in batch]
-            if len(present_img_keys) == 0:
-                raise ValueError(
-                    f"All image features are missing from the batch. At least one expected. (batch: {batch.keys()}) (image_features:{self.config.image_features})"
-                )
+        """Preprocess LeRobot batch into inputs"""
+        images = {}
+        present_img_keys = [key for key in self.image_keys if key in batch]
+        if len(present_img_keys) == 0:
+            raise ValueError(
+                f"All image features are missing from the batch. At least one expected. (batch: {batch.keys()}) (image_features:{self.config.image_features})"
+            )
 
-            for key in self.image_keys:
-                if key in present_img_keys:
-                    img = batch[key]
+        for key in self.image_keys:
+            if key in present_img_keys:
+                img = batch[key]
 
-                images[key] = img
-            return images
+            images[key] = img
+        return images
 
     def forward(self, batch: dict[str, Tensor]):
         device = batch[OBS_STATE].device
 
         with record_function("create_input_tokens"):
-
             images = self.prepare_images(batch)
 
-            padded_outs, loss_mask  = self.create_input_tokens(
+            padded_outs, loss_mask = self.create_input_tokens(
                 states=batch[OBS_STATE],
                 images=images,
                 lang_text=batch.get("task", ""),
@@ -427,7 +432,11 @@ class VLA0(nn.Module):
             loss = token_loss.sum() / torch.clamp(loss_mask.sum(), min=1)
 
             # Return loss dictionary
-            loss_dict = {"ce_loss": loss.item(), "loss": loss, "sequence_len": padded_outs["input_ids"].shape[-1]}
+            loss_dict = {
+                "ce_loss": loss.item(),
+                "loss": loss,
+                "sequence_len": padded_outs["input_ids"].shape[-1],
+            }
         return loss_dict
 
     def generate_actions(self, batch: dict[str, torch.Tensor]):
@@ -487,7 +496,7 @@ class VLA0(nn.Module):
                 final_actions.append(torch.zeros(n_expected, device=device, dtype=torch.long))
             else:
                 final_actions.append(torch.tensor([int(a) for a in actions], device=device))
-   
+
         discretized_actions = torch.stack(final_actions, dim=0).reshape(batch_size, -1, self.action_dim)
 
         # Assuming same bin setup

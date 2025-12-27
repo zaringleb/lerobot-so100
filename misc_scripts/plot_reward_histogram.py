@@ -10,15 +10,15 @@ Example:
 import argparse
 import json
 import os
-from typing import Iterable, List
+from collections.abc import Iterable
 
 import matplotlib.pyplot as plt
 
 METRIC_NAME = "max_rewards"
 
 
-def load_max_rewards(eval_json_path: str) -> List[float]:
-    with open(eval_json_path, "r") as f:
+def load_max_rewards(eval_json_path: str) -> list[float]:
+    with open(eval_json_path) as f:
         data = json.load(f)
 
     assert len(data.get("per_task", [])) == 1, "Expected exactly one task entry"
@@ -42,9 +42,8 @@ def plot_histogram_excluding_ones(values: Iterable[float], output_path: str, bin
     plt.ylabel("frequency")
 
     # Add a green bar to the right of 1.0 to show the count of 1.0 values
-    bar_width = 1 / bins
     if count_ones > 0:
-        plt.bar(1., count_ones, width=1 / bins, color="green", align="edge")
+        plt.bar(1.0, count_ones, width=1 / bins, color="green", align="edge")
 
     plt.xlim(0, 1.1)
 

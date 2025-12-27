@@ -1,4 +1,4 @@
-f"""
+"""
 CLI utility for working with FAST action tokenizers.
 
 Subcommands:
@@ -32,18 +32,18 @@ Examples:
 import argparse
 import os
 from collections import Counter
-from typing import Iterable, Tuple
-from tqdm import tqdm
-from scipy.fft import dct
+from collections.abc import Iterable
+
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+from scipy.fft import dct
+from tqdm import tqdm
 from transformers import AutoProcessor
 
+from lerobot.configs.types import FeatureType, NormalizationMode, PolicyFeature
 from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
 from lerobot.processor.normalize_processor import NormalizerProcessorStep
-from lerobot.configs.types import FeatureType, NormalizationMode, PolicyFeature
-
 
 BASE_TOKENIZER = "physical-intelligence/fast"
 
@@ -52,8 +52,8 @@ def _build_dataset_local(repo_id: str, horizon: int) -> LeRobotDataset:
     meta = LeRobotDatasetMetadata(repo_id)
     fps = meta.fps
 
-    delta_timestamps = {
-        "observation.state": [0], # Do we need observations?
+    delta_timestamps: dict[str, list[float]] = {
+        "observation.state": [0],  # Do we need observations?
         "action": [t / fps for t in range(horizon)],
     }
     dataset = LeRobotDataset(repo_id, delta_timestamps=delta_timestamps, download_videos=False)
@@ -75,15 +75,17 @@ def _iterate_normalized_actions(
     n = len(dataset)
     for i in tqdm(range(n), desc="Iterating dataset for actions"):
         a = dataset[i]["action"].numpy()  # shape: (horizon, action_dim)
-        a_norm = normalizer._normalize_action(torch.as_tensor(a, dtype=torch.float32), inverse=False).cpu().numpy()
+        a_norm = (
+            normalizer._normalize_action(torch.as_tensor(a, dtype=torch.float32), inverse=False).cpu().numpy()
+        )
         yield a_norm
 
 
 def _count_tokens(
     processor,
     actions_iter: Iterable[np.ndarray],
-) -> Tuple[Counter, int]:
-    count = Counter()
+) -> tuple[Counter, int]:
+    count: Counter = Counter()
     for a_norm in actions_iter:
         # Count FAST tokens
         toks = processor(a_norm)
@@ -97,8 +99,8 @@ def _count_tokens(
 def _count_coeffs(
     scale: int,
     actions_iter: Iterable[np.ndarray],
-) -> Tuple[Counter, int]:
-    count = Counter()
+) -> tuple[Counter, int]:
+    count: Counter = Counter()
 
     # Ugly copy-paste from FAST tokenizer to count DCT coefficients
     dct_tokens = [dct(a_norm, axis=0, norm="ortho").flatten() for a_norm in actions_iter]
@@ -134,7 +136,7 @@ def _save_bar_plot(count: Counter, vocab_size: int, title: str) -> None:
 
 def cmd_plot_tokens(args: argparse.Namespace) -> None:
     processor = AutoProcessor.from_pretrained(args.tokenizer, trust_remote_code=True)
-    
+
     dataset = _build_dataset_local(args.dataset, args.horizon)
     normalizer = _build_min_max_normalizer(dataset)
 
@@ -145,7 +147,6 @@ def cmd_plot_tokens(args: argparse.Namespace) -> None:
 
 
 def cmd_plot_coeffs(args: argparse.Namespace) -> None:
-    
     dataset = _build_dataset_local(args.dataset, args.horizon)
     normalizer = _build_min_max_normalizer(dataset)
 
@@ -170,9 +171,9 @@ def cmd_fit(args: argparse.Namespace) -> None:
 
     # Get the class implementing FAST
     base_proc = AutoProcessor.from_pretrained(BASE_TOKENIZER, trust_remote_code=True)
-    FastClass = type(base_proc)
+    fast_class = type(base_proc)
 
-    tokeniser = FastClass.fit(
+    tokeniser = fast_class.fit(
         actions,
         scale=args.scale,
         vocab_size=args.vocab_size,
@@ -190,7 +191,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     # plot tokens subcommand
-    p_plot_t = sub.add_parser("plot_tokens", help="Plot token frequency bar chart for a tokenizer on a dataset")
+    p_plot_t = sub.add_parser(
+        "plot_tokens", help="Plot token frequency bar chart for a tokenizer on a dataset"
+    )
     p_plot_t.add_argument("--tokenizer", required=True, help="Tokenizer hub id or local directory")
     p_plot_t.add_argument("--dataset", required=True, help="Local dataset root directory")
     p_plot_t.add_argument("--horizon", type=int, help="Temporal horizon for action windows")
@@ -223,5 +226,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-

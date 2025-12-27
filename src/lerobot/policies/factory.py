@@ -34,14 +34,13 @@ from lerobot.policies.diffusion.configuration_diffusion import DiffusionConfig
 from lerobot.policies.groot.configuration_groot import GrootConfig
 from lerobot.policies.pi0.configuration_pi0 import PI0Config
 from lerobot.policies.pi05.configuration_pi05 import PI05Config
-from lerobot.policies.smolandfast.configuration_smolandfast import SMOLANDFASTConfig
-from lerobot.policies.vla0_smol.configuration_vla0_smol import VLA0SmolConfig
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.policies.sac.configuration_sac import SACConfig
 from lerobot.policies.sac.reward_model.configuration_classifier import RewardClassifierConfig
+from lerobot.policies.smolandfast.configuration_smolandfast import SMOLANDFASTConfig
 from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
 from lerobot.policies.tdmpc.configuration_tdmpc import TDMPCConfig
-from lerobot.policies.utils import validate_visual_features_consistency
+from lerobot.policies.vla0_smol.configuration_vla0_smol import VLA0SmolConfig
 from lerobot.policies.vqbet.configuration_vqbet import VQBeTConfig
 from lerobot.policies.xvla.configuration_xvla import XVLAConfig
 from lerobot.processor import PolicyAction, PolicyProcessorPipeline
@@ -350,7 +349,7 @@ def make_pre_post_processors(
             config=policy_cfg,
             dataset_stats=kwargs.get("dataset_stats"),
         )
-    
+
     elif isinstance(policy_cfg, SMOLANDFASTConfig):
         from lerobot.policies.smolandfast.processor_smolandfast import make_smolandfast_pre_post_processors
 
@@ -456,7 +455,7 @@ def make_policy(
     else:
         # Make a fresh policy.
         policy = policy_cls(**kwargs)
-    
+
     policy.to(cfg.device)
     assert isinstance(policy, torch.nn.Module)
 
