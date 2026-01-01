@@ -455,36 +455,39 @@ class VLA0(nn.Module):
 
         input_len = padded_outs["input_ids"].shape[1]
 
-        # initialize grammar
-        xgr_logits_processor = xgr.contrib.hf.LogitsProcessor(self.compiled_grammar)
+        # ---- PREFILL (image is used here) ----
+        with torch.inference_mode():
+            out = self.vlm(**padded_outs, use_cache=True)
 
-        # Model inference on GPU (no gradient)
-        output_tokens = self.vlm.generate(
-            input_ids=padded_outs["input_ids"],
-            attention_mask=padded_outs["attention_mask"],
-            pixel_values=padded_outs["pixel_values"],
-            pixel_attention_mask=padded_outs["pixel_attention_mask"],
-            use_cache=self.config.use_cache,
-            max_new_tokens=self.config.max_decoding_steps,
-            do_sample=False,
-            num_beams=1,
-            eos_token_id=self.eos_token_id,
-            pad_token_id=self.pad_token_id,
-            logits_processor=[xgr_logits_processor],
-        )
+        past = out.past_key_values
 
-        # Slice to generated part
-        action_tokens = output_tokens[:, input_len:]
+        # start from next token (greedy)
+        next_token = out.logits[:, -1, :].argmax(-1, keepdim=True)
 
-        # Remove padding/eos tokens efficiently on GPU
-        valid_mask = (action_tokens != self.eos_token_id) & (action_tokens != self.pad_token_id)
-        # Replace invalid tokens with pad (or zero) for decoding
-        action_tokens = torch.where(valid_mask, action_tokens, torch.tensor(self.pad_token_id, device=device))
+        NUM_TOKENS = 512
+        tokens = []
 
-        # Decode in batch (vectorized)
-        # Decode all at once instead of Python loop
-        decoded_texts = self.processor.batch_decode(action_tokens, skip_special_tokens=True)
+        finish_gen = [False]*batch_size
 
+        for _ in range(NUM_TOKENS):
+            with torch.no_grad():
+                out = self.vlm(input_ids=next_token,
+                            past_key_values=past,
+                            use_cache=True)
+            past = out.past_key_values
+            next_token = out.logits[:, -1, :].argmax(-1, keepdim=True)
+            tokens.append(next_token)
+            for i in range(batch_size):
+                if finish_gen[i]:
+                    next_token[i, 0] = self.pad_token_id
+                elif next_token[i, 0] == self.eos_token_id or next_token[i, 0] == self.pad_token_id:
+                    finish_gen[i] = True
+            if sum(finish_gen) == batch_size:
+                break
+
+        tokens = torch.cat(tokens,dim=-1)
+
+        decoded_texts = self.processor.batch_decode(tokens, skip_special_tokens=True)
         # Convert decoded strings to numeric actions (vectorized)
         final_actions = []
         n_expected = self.action_horizon * self.action_dim

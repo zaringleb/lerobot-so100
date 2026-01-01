@@ -57,8 +57,8 @@ class VLA0SmolConfig(PreTrainedConfig):
     start_actions_token: int = 49279
 
     grad_clip_norm: float = 1.0
-    action_mask_aug_per: float = 0.1
-    action_mask_skip_per: float = 0.1
+    action_mask_aug_per: float = 0.0
+    action_mask_skip_per: float = 1.0
 
     # Image crop parameters
     crop_shape: tuple[int, int] | None = None
