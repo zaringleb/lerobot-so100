@@ -235,6 +235,14 @@ class VLA0(nn.Module):
         ebnf_string = build_exact_n_numbers_grammar(total_actions)
         self.compiled_grammar = self.grammar_compiler.compile_grammar(ebnf_string)
 
+        # stream generation
+        self.new_obs = True
+        self.past_key_values = None
+        self.generated_tokens = None
+        self.finish_generation = None
+        self.num_actions_generated = None
+        self.action_index = 0
+
     def apply_action_masking(self, actions: list[list[str]]):
         if not self.training:
             return actions
@@ -438,69 +446,33 @@ class VLA0(nn.Module):
                 "sequence_len": padded_outs["input_ids"].shape[-1],
             }
         return loss_dict
+    
+    def generate_next_token(self, last_token, past_key_values):
+        with torch.no_grad():
+            out = self.vlm(input_ids=last_token,
+                           past_key_values=past_key_values,
+                           use_cache=True)
+        generated_token = out.logits[:, -1, :].argmax(-1, keepdim=True)
+        return generated_token, out.past_key_values
 
-    def generate_actions(self, batch: dict[str, torch.Tensor]):
-        device = next(self.vlm.parameters()).device
-        batch_size = batch[OBS_STATE].shape[0]
-
-        images = self.prepare_images(batch)
-
-        # Prepare inputs directly on GPU
-        padded_outs, _ = self.create_input_tokens(
-            states=batch[OBS_STATE],
-            images=images,
-            lang_text=batch.get("task", ""),
-            actions=None,
-        )
-
-        input_len = padded_outs["input_ids"].shape[1]
-
-        # ---- PREFILL (image is used here) ----
-        with torch.inference_mode():
-            out = self.vlm(**padded_outs, use_cache=True)
-
-        past = out.past_key_values
-
-        # start from next token (greedy)
-        next_token = out.logits[:, -1, :].argmax(-1, keepdim=True)
-
-        NUM_TOKENS = 512
-        tokens = []
-
-        finish_gen = [False]*batch_size
-
-        for _ in range(NUM_TOKENS):
-            with torch.no_grad():
-                out = self.vlm(input_ids=next_token,
-                            past_key_values=past,
-                            use_cache=True)
-            past = out.past_key_values
-            next_token = out.logits[:, -1, :].argmax(-1, keepdim=True)
-            tokens.append(next_token)
+    def check_end_of_generation(self, generated_token = None):
+        if generated_token is not None:
+            batch_size = generated_token.shape[0]
             for i in range(batch_size):
-                if finish_gen[i]:
-                    next_token[i, 0] = self.pad_token_id
-                elif next_token[i, 0] == self.eos_token_id or next_token[i, 0] == self.pad_token_id:
-                    finish_gen[i] = True
-            if sum(finish_gen) == batch_size:
-                break
+                if self.finish_generation[i]:
+                    generated_token[i, 0] = self.pad_token_id
+                elif generated_token[i, 0] == self.eos_token_id or generated_token[i, 0] == self.pad_token_id:
+                    self.finish_generation[i] = True
 
-        tokens = torch.cat(tokens,dim=-1)
+        if sum(self.finish_generation) == len(self.finish_generation):
+            return True
+        return False
 
-        decoded_texts = self.processor.batch_decode(tokens, skip_special_tokens=True)
-        # Convert decoded strings to numeric actions (vectorized)
-        final_actions = []
-        n_expected = self.action_horizon * self.action_dim
-        n_bins = self.config.n_state_bins
+    def reconstruct_actions(self, decoded_actions, batch):
+        batch_size = batch[OBS_STATE].shape[0]
+        device = batch[OBS_STATE].device
 
-        for text in decoded_texts:
-            actions = text.strip().split()
-            if len(actions) != n_expected or not all(a.isdigit() and 0 <= int(a) < n_bins for a in actions):
-                final_actions.append(torch.zeros(n_expected, device=device, dtype=torch.long))
-            else:
-                final_actions.append(torch.tensor([int(a) for a in actions], device=device))
-
-        discretized_actions = torch.stack(final_actions, dim=0).reshape(batch_size, -1, self.action_dim)
+        discretized_actions = torch.stack(decoded_actions, dim=0).reshape(batch_size, -1, self.action_dim)
 
         # Assuming same bin setup
         bins = torch.linspace(-1.0 - EPS, 1.0 + EPS, self.config.n_state_bins + 1, device=device)
@@ -512,4 +484,84 @@ class VLA0(nn.Module):
         reconstructed_actions = bin_centers[discretized_actions.clamp(0, self.config.n_state_bins - 1)]
         if self.config.relative_actions:
             reconstructed_actions += batch[OBS_STATE].unsqueeze(1)
+        
         return reconstructed_actions
+
+    def generate_one_action(self, batch):
+        device = next(self.vlm.parameters()).device
+        batch_size = batch[OBS_STATE].shape[0]
+
+        if self.new_obs:
+            self.new_obs = False
+            # do prefill
+            images = self.prepare_images(batch)
+
+            # Prepare inputs directly on GPU
+            padded_outs, _ = self.create_input_tokens(
+                states=batch[OBS_STATE],
+                images=images,
+                lang_text=batch.get("task", ""),
+                actions=None,
+            )
+
+            self.past_key_values = out.past_key_values
+            self.generated_tokens = []
+            self.finish_generation = [False]*batch_size
+            self.num_actions_generated = [0]*batch_size
+            self.action_index = 0
+
+            # ---- PREFILL AND FIRST TOKEN----
+            with torch.inference_mode():
+                out = self.vlm(**padded_outs, use_cache=True)
+            generated_token = out.logits[:, -1, :].argmax(-1, keepdim=True)
+            self.generated_tokens.append(generated_token)
+
+        next_action_is_generated = [False]*batch_size
+
+        # generate one action
+        num_remained_tokens = self.config.max_decoding_steps - len(self.generated_tokens)
+        for _ in range(num_remained_tokens):
+            generated_token, past_key_values = self.generate_next_token(last_token=self.generated_tokens[-1],
+                                                                        past_key_values=self.past_key_values)
+            self.generated_tokens.append(generated_token)
+            self.past_key_values = past_key_values
+
+            #check end of generation
+            if self.check_end_of_generation(generated_token):
+                self.new_obs = True
+            
+            # decode every new sequence and count amount of spaces 
+            decoded_actions = [None]*batch_size
+
+            tokens_pt = torch.cat(self.generated_tokens,dim=-1)
+            decoded_texts = self.processor.batch_decode(tokens_pt, skip_special_tokens=True) # return list of lists
+
+            for i in range(batch_size):
+                if next_action_is_generated[i]:
+                    continue
+
+                output = decoded_texts[i].strip().split()
+
+                # if output is invalid just add zeros
+                n_bins = self.config.n_state_bins
+                if not all(a.isdigit() and 0 <= int(a) < n_bins for a in output):
+                    next_action_is_generated[i] = True
+                    decoded_actions[i] = torch.zeros(self.action_dim, device=device, dtype=torch.long)
+
+                # check if we finished next action generation
+                if self.finish_generation[i] or len(output) > self.action_dim*(self.action_index + 1):
+                    next_action_is_generated[i] = True
+                    decoded_actions[i] = torch.tensor([int(a) for a in output[-self.action_dim:]], device=device)
+                
+            if sum(next_action_is_generated) == len(next_action_is_generated):
+                return self.reconstruct_actions(decoded_actions)
+        # if we did not get 
+        return torch.zeros((batch_size, 1, self.action_dim), device=device, dtype=torch.long)
+
+    def generate_actions(self, batch: dict[str, torch.Tensor]):
+        actions = []
+        for _ in range(self.action_horizon):
+            action = self.generate_one_action(batch=batch)
+            actions.append(action)
+
+        return torch.cat(actions)
