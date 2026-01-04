@@ -96,19 +96,20 @@ class VLA0SmolPolicy(PreTrainedPolicy):
             actions = actions[:, :, :original_action_dim]
 
             return self.temporal_ensembler.update(actions)
+        elif self.config.action_streaming:
+            next_action = self.model.generate_one_action(batch).squeeze(1)
+            return next_action 
         else:
             # Action queue logic for n_action_steps > 1. When the action_queue is depleted, populate it by
             # querying the policy.
             if len(self._action_queue) == 0:
                 actions = self.model.generate_actions(batch)
-                actions = actions[:, : self.config.n_action_steps]
-
-                original_action_dim = self.config.action_feature.shape[0]
-                actions = actions[:, :, :original_action_dim]
+                actions = actions[:, :self.config.n_action_steps] # torch.Size([batch_size, self.config.n_action_steps, action_dim])
                 # `self.model.forward` returns a (batch_size, n_action_steps, action_dim) tensor, but the queue
                 # effectively has shape (n_action_steps, batch_size, *), hence the transpose.
                 self._action_queue.extend(actions.transpose(0, 1))
-            return self._action_queue.popleft()
+            next_action = self._action_queue.popleft() # torch.Size([batch_size, action_dim])
+            return next_action
 
     def forward(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
         loss_dict = self.model.forward(batch)
@@ -242,6 +243,7 @@ class VLA0(nn.Module):
         self.finish_generation = None
         self.num_actions_generated = None
         self.action_index = 0
+        self.generation_batch = None
 
     def apply_action_masking(self, actions: list[list[str]]):
         if not self.training:
@@ -490,17 +492,17 @@ class VLA0(nn.Module):
     def generate_one_action(self, batch):
         device = next(self.vlm.parameters()).device
         batch_size = batch[OBS_STATE].shape[0]
-
         if self.new_obs:
             self.new_obs = False
-            # do prefill
+            self.generation_batch = batch
+
             images = self.prepare_images(batch)
 
             # Prepare inputs directly on GPU
             padded_outs, _ = self.create_input_tokens(
-                states=batch[OBS_STATE],
+                states=self.generation_batch[OBS_STATE],
                 images=images,
-                lang_text=batch.get("task", ""),
+                lang_text=self.generation_batch.get("task", ""),
                 actions=None,
             )
 
@@ -534,7 +536,7 @@ class VLA0(nn.Module):
             # decode every new sequence and count amount of spaces 
             tokens_pt = torch.cat(self.generated_tokens,dim=-1)
             decoded_texts = self.processor.batch_decode(tokens_pt, skip_special_tokens=True) # return list of lists
-            # print(decoded_texts)
+
             for i in range(batch_size):
                 if next_action_is_generated[i]:
                     continue
@@ -546,30 +548,27 @@ class VLA0(nn.Module):
                 if not all(a.isdigit() and 0 <= int(a) < n_bins for a in output):
                     next_action_is_generated[i] = True
                     decoded_actions[i] = torch.zeros(self.action_dim, device=device, dtype=torch.long)
-                # if i ==0:
-                    # print(len(output),self.action_dim*(self.action_index + 1))
                 # check if we finished next action generation
-                if self.finish_generation[i]:
+                if self.finish_generation[i] or len(output) > self.action_dim*(self.action_index + 1):
                     next_action_is_generated[i] = True
-                    decoded_actions[i] = torch.tensor([int(a) for a in output[-self.action_dim:]], device=device)
-                elif len(output) > self.action_dim*(self.action_index + 1):
-                    next_action_is_generated[i] = True
-                    decoded_actions[i] = torch.tensor([int(a) for a in output[-self.action_dim-1:-1]], device=device)
+                    action_text = output[self.action_dim*(self.action_index):self.action_dim*(self.action_index + 1)]
+                    decoded_actions[i] = torch.tensor([int(a) for a in action_text], device=device)
                 
             if sum(next_action_is_generated) == len(next_action_is_generated):
                 self.action_index += 1
-                return self.reconstruct_actions(decoded_actions, batch)
+                if self.action_index == self.config.n_action_steps:
+                    self.new_obs = True
+                return self.reconstruct_actions(decoded_actions, self.generation_batch)
         # if we did not get 
         return torch.zeros((batch_size, 1, self.action_dim), device=device, dtype=torch.long)
 
     def generate_actions(self, batch: dict[str, torch.Tensor]):
         actions = []
-        for _ in range(self.action_horizon):
+        self.new_obs = True
+
+        for _ in range(self.config.n_action_steps):
             action = self.generate_one_action(batch=batch)
-            # print(f"Action shape: {action.shape}")
-            # print(action)
             actions.append(action)
+
         action_chunk = torch.cat(actions, dim=1)
-        # print(action_chunk)
-        # print(action_chunk.shape)
         return action_chunk
