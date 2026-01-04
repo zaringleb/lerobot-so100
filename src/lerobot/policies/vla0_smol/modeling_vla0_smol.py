@@ -421,6 +421,24 @@ class VLA0(nn.Module):
                 use_cache=self.config.use_cache,
             )
 
+            # ? # should we train together main model and speculator head # ? #
+
+            # <START>
+
+            # get last hidden layer [bs, seq_len, hidden_dim]
+            f = None
+            # get targets embedings [bs, seq_len, hidden_dim]
+            e = None
+            de = torch.cat([f,e], dim=-1) # [bs, seq_len, 2 * hidden_dim]
+            spec_fc = None # spec_fc = nn.Linear(2 * hidden_dim, hidden_dim)
+            de_hidden = spec_fc(de) # [bs, seq_len, hidden_dim]
+            spec_head = None # spec head is a layer from text model (find a way to copy ?)
+            f_spec = spec_head(de_hidden) # [bs, seq_len, hidden_dim]
+            lm_head = None # it should be something like self.vlm.model.text_model.lm_head
+            logits_spec = lm_head(f_spec) # [bs, seq_len, vocab_size]
+
+            # <STOP>
+
         with record_function("loss"):
             logits = outputs.logits
             logits = logits.to(torch.float32)
@@ -438,8 +456,20 @@ class VLA0(nn.Module):
             # Apply loss mask
             token_loss = token_loss * loss_mask.reshape(-1)
 
+            # <START>
+
+            # regressin loss
+            loss_reg = nn.functional.smooth_l1_loss(f_spec, f)
+
+            loss_cls_fct = nn.CrossEntropyLoss(reduction="mean")
+            loss_cls = loss_cls_fct(logits_spec.reshape(-1, logits_spec.shape[-1]), targets.reshape(-1))
+
+            spec_loss = loss_reg + 0.1 * loss_cls 
+
+            # <STOP>
+
             # Compute final loss
-            loss = token_loss.sum() / torch.clamp(loss_mask.sum(), min=1)
+            loss = token_loss.sum() / torch.clamp(loss_mask.sum(), min=1) + spec_loss
 
             # Return loss dictionary
             loss_dict = {
@@ -447,6 +477,8 @@ class VLA0(nn.Module):
                 "loss": loss,
                 "sequence_len": padded_outs["input_ids"].shape[-1],
             }
+
+
         return loss_dict
     
     def generate_next_token(self, last_token, past_key_values):
