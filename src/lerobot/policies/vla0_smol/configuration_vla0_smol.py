@@ -60,6 +60,7 @@ class VLA0SmolConfig(PreTrainedConfig):
     action_mask_aug_per: float = 0.1
     action_mask_skip_per: float = 0.1
 
+    action_streaming = True
     # Image crop parameters
     crop_shape: tuple[int, int] | None = None
 

@@ -96,19 +96,20 @@ class VLA0SmolPolicy(PreTrainedPolicy):
             actions = actions[:, :, :original_action_dim]
 
             return self.temporal_ensembler.update(actions)
+        elif self.config.action_streaming:
+            next_action = self.model.generate_one_action(batch).squeeze(1)
+            return next_action 
         else:
             # Action queue logic for n_action_steps > 1. When the action_queue is depleted, populate it by
             # querying the policy.
             if len(self._action_queue) == 0:
                 actions = self.model.generate_actions(batch)
-                actions = actions[:, : self.config.n_action_steps]
-
-                original_action_dim = self.config.action_feature.shape[0]
-                actions = actions[:, :, :original_action_dim]
+                actions = actions[:, :self.config.n_action_steps] # torch.Size([batch_size, self.config.n_action_steps, action_dim])
                 # `self.model.forward` returns a (batch_size, n_action_steps, action_dim) tensor, but the queue
                 # effectively has shape (n_action_steps, batch_size, *), hence the transpose.
                 self._action_queue.extend(actions.transpose(0, 1))
-            return self._action_queue.popleft()
+            next_action = self._action_queue.popleft() # torch.Size([batch_size, action_dim])
+            return next_action
 
     def forward(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
         loss_dict = self.model.forward(batch)
@@ -234,6 +235,15 @@ class VLA0(nn.Module):
         total_actions = self.config.chunk_size * self.config.action_feature.shape[0]
         ebnf_string = build_exact_n_numbers_grammar(total_actions)
         self.compiled_grammar = self.grammar_compiler.compile_grammar(ebnf_string)
+
+        # stream generation
+        self.new_obs = True
+        self.past_key_values = None
+        self.generated_tokens = None
+        self.finish_generation = None
+        self.num_actions_generated = None
+        self.action_index = 0
+        self.generation_batch = None
 
     def apply_action_masking(self, actions: list[list[str]]):
         if not self.training:
@@ -438,6 +448,119 @@ class VLA0(nn.Module):
                 "sequence_len": padded_outs["input_ids"].shape[-1],
             }
         return loss_dict
+    
+    def generate_next_token(self, last_token, past_key_values):
+        with torch.no_grad():
+            out = self.vlm(input_ids=last_token,
+                           past_key_values=past_key_values,
+                           use_cache=True)
+        generated_token = out.logits[:, -1, :].argmax(-1, keepdim=True)
+        return generated_token, out.past_key_values
+
+    def check_end_of_generation(self, generated_token = None):
+        if generated_token is not None:
+            batch_size = generated_token.shape[0]
+            for i in range(batch_size):
+                if self.finish_generation[i]:
+                    generated_token[i, 0] = self.pad_token_id
+                elif generated_token[i, 0] == self.eos_token_id or generated_token[i, 0] == self.pad_token_id:
+                    self.finish_generation[i] = True
+
+        if sum(self.finish_generation) == len(self.finish_generation):
+            return True
+        return False
+
+    def reconstruct_actions(self, decoded_actions, batch):
+        batch_size = batch[OBS_STATE].shape[0]
+        device = batch[OBS_STATE].device
+        # print(f"decoded actions: {decoded_actions}")
+        discretized_actions = torch.stack(decoded_actions, dim=0).reshape(batch_size, -1, self.action_dim)
+
+        # Assuming same bin setup
+        bins = torch.linspace(-1.0 - EPS, 1.0 + EPS, self.config.n_state_bins + 1, device=device)
+
+        # Compute bin centers (midpoints between edges)
+        bin_centers = 0.5 * (bins[:-1] + bins[1:])  # shape: [n_state_bins]
+
+        # Map discretized indices back to continuous states
+        reconstructed_actions = bin_centers[discretized_actions.clamp(0, self.config.n_state_bins - 1)]
+        if self.config.relative_actions:
+            reconstructed_actions += batch[OBS_STATE].unsqueeze(1)
+        
+        return reconstructed_actions
+
+    def generate_one_action(self, batch):
+        device = next(self.vlm.parameters()).device
+        batch_size = batch[OBS_STATE].shape[0]
+        if self.new_obs:
+            self.new_obs = False
+            self.generation_batch = batch
+
+            images = self.prepare_images(batch)
+
+            # Prepare inputs directly on GPU
+            padded_outs, _ = self.create_input_tokens(
+                states=self.generation_batch[OBS_STATE],
+                images=images,
+                lang_text=self.generation_batch.get("task", ""),
+                actions=None,
+            )
+
+            self.generated_tokens = []
+            self.finish_generation = [False]*batch_size
+            self.num_actions_generated = [0]*batch_size
+            self.action_index = 0
+
+            # ---- PREFILL AND FIRST TOKEN----
+            with torch.inference_mode():
+                out = self.vlm(**padded_outs, use_cache=True)
+            generated_token = out.logits[:, -1, :].argmax(-1, keepdim=True)
+            self.generated_tokens.append(generated_token)
+            self.past_key_values = out.past_key_values
+
+        next_action_is_generated = [False]*batch_size
+        decoded_actions = [None]*batch_size
+
+        # generate one action
+        num_remained_tokens = self.config.max_decoding_steps - len(self.generated_tokens)
+        for _ in range(num_remained_tokens):
+            generated_token, past_key_values = self.generate_next_token(last_token=self.generated_tokens[-1],
+                                                                        past_key_values=self.past_key_values)
+            self.generated_tokens.append(generated_token)
+            self.past_key_values = past_key_values
+
+            #check end of generation
+            if self.check_end_of_generation(generated_token):
+                self.new_obs = True
+            
+            # decode every new sequence and count amount of spaces 
+            tokens_pt = torch.cat(self.generated_tokens,dim=-1)
+            decoded_texts = self.processor.batch_decode(tokens_pt, skip_special_tokens=True) # return list of lists
+
+            for i in range(batch_size):
+                if next_action_is_generated[i]:
+                    continue
+
+                output = decoded_texts[i].strip().split()
+
+                # if output is invalid just add zeros
+                n_bins = self.config.n_state_bins
+                if not all(a.isdigit() and 0 <= int(a) < n_bins for a in output):
+                    next_action_is_generated[i] = True
+                    decoded_actions[i] = torch.zeros(self.action_dim, device=device, dtype=torch.long)
+                # check if we finished next action generation
+                if self.finish_generation[i] or len(output) > self.action_dim*(self.action_index + 1):
+                    next_action_is_generated[i] = True
+                    action_text = output[self.action_dim*(self.action_index):self.action_dim*(self.action_index + 1)]
+                    decoded_actions[i] = torch.tensor([int(a) for a in action_text], device=device)
+                
+            if sum(next_action_is_generated) == len(next_action_is_generated):
+                self.action_index += 1
+                if self.action_index == self.config.n_action_steps:
+                    self.new_obs = True
+                return self.reconstruct_actions(decoded_actions, self.generation_batch)
+        # if we did not get 
+        return torch.zeros((batch_size, 1, self.action_dim), device=device, dtype=torch.long)
 
     def generate_actions(self, batch: dict[str, torch.Tensor]):
         device = next(self.vlm.parameters()).device

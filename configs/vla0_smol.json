@@ -52,7 +52,7 @@
         "batch_size": 64
     },
     "wandb": {
-        "enable": false,
+        "enable": true,
         "project": "lerobot"
     }
 }
