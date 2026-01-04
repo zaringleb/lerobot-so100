@@ -563,12 +563,73 @@ class VLA0(nn.Module):
         return torch.zeros((batch_size, 1, self.action_dim), device=device, dtype=torch.long)
 
     def generate_actions(self, batch: dict[str, torch.Tensor]):
-        actions = []
-        self.new_obs = True
+        device = next(self.vlm.parameters()).device
+        batch_size = batch[OBS_STATE].shape[0]
 
-        for _ in range(self.config.n_action_steps):
-            action = self.generate_one_action(batch=batch)
-            actions.append(action)
+        images = self.prepare_images(batch)
 
-        action_chunk = torch.cat(actions, dim=1)
-        return action_chunk
+        # Prepare inputs directly on GPU
+        padded_outs, _ = self.create_input_tokens(
+            states=batch[OBS_STATE],
+            images=images,
+            lang_text=batch.get("task", ""),
+            actions=None,
+        )
+
+        input_len = padded_outs["input_ids"].shape[1]
+
+        # initialize grammar
+        xgr_logits_processor = xgr.contrib.hf.LogitsProcessor(self.compiled_grammar)
+
+        # Model inference on GPU (no gradient)
+        output_tokens = self.vlm.generate(
+            input_ids=padded_outs["input_ids"],
+            attention_mask=padded_outs["attention_mask"],
+            pixel_values=padded_outs["pixel_values"],
+            pixel_attention_mask=padded_outs["pixel_attention_mask"],
+            use_cache=self.config.use_cache,
+            max_new_tokens=self.config.max_decoding_steps,
+            do_sample=False,
+            num_beams=1,
+            eos_token_id=self.eos_token_id,
+            pad_token_id=self.pad_token_id,
+            logits_processor=[xgr_logits_processor],
+        )
+
+        # Slice to generated part
+        action_tokens = output_tokens[:, input_len:]
+
+        # Remove padding/eos tokens efficiently on GPU
+        valid_mask = (action_tokens != self.eos_token_id) & (action_tokens != self.pad_token_id)
+        # Replace invalid tokens with pad (or zero) for decoding
+        action_tokens = torch.where(valid_mask, action_tokens, torch.tensor(self.pad_token_id, device=device))
+
+        # Decode in batch (vectorized)
+        # Decode all at once instead of Python loop
+        decoded_texts = self.processor.batch_decode(action_tokens, skip_special_tokens=True)
+
+        # Convert decoded strings to numeric actions (vectorized)
+        final_actions = []
+        n_expected = self.action_horizon * self.action_dim
+        n_bins = self.config.n_state_bins
+
+        for text in decoded_texts:
+            actions = text.strip().split()
+            if len(actions) != n_expected or not all(a.isdigit() and 0 <= int(a) < n_bins for a in actions):
+                final_actions.append(torch.zeros(n_expected, device=device, dtype=torch.long))
+            else:
+                final_actions.append(torch.tensor([int(a) for a in actions], device=device))
+
+        discretized_actions = torch.stack(final_actions, dim=0).reshape(batch_size, -1, self.action_dim)
+
+        # Assuming same bin setup
+        bins = torch.linspace(-1.0 - EPS, 1.0 + EPS, self.config.n_state_bins + 1, device=device)
+
+        # Compute bin centers (midpoints between edges)
+        bin_centers = 0.5 * (bins[:-1] + bins[1:])  # shape: [n_state_bins]
+
+        # Map discretized indices back to continuous states
+        reconstructed_actions = bin_centers[discretized_actions.clamp(0, self.config.n_state_bins - 1)]
+        if self.config.relative_actions:
+            reconstructed_actions += batch[OBS_STATE].unsqueeze(1)
+        return reconstructed_actions
