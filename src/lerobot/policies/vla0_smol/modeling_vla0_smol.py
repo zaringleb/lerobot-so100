@@ -23,12 +23,14 @@ except ImportError:
     HAS_LOCAL_DEPS = False
 
 try:
-    from openai import OpenAI
     import base64
     import io
     import numpy as np
     from PIL import Image
-    
+
+    import asyncio
+    from openai import AsyncOpenAI
+
     logging.getLogger("httpx").setLevel(logging.WARNING)
     HAS_REMOTE_DEPS = True
 except ImportError:
@@ -142,13 +144,51 @@ class VLA0SmolPolicy(PreTrainedPolicy):
         return loss, loss_dict
 
 
-def build_exact_n_numbers_grammar(n_numbers: int) -> str:
+def get_range_regex(min_val: int, max_val: int) -> str:
+    if min_val == 0 and max_val == 1024:
+        # 0-9 | 10-99 | 100-999 | 1000-1019 | 1020-1023
+        return (
+            "("
+            "[0-9] | "
+            "[1-9] [0-9] | "
+            "[1-9] [0-9] [0-9] | "
+            "\"10\" [0-1] [0-9] | "
+            "\"102\" [0-3]"
+            ")"
+        )
+    elif min_val == 0 and max_val == 512:
+        # 0-9 | 10-99 | 100-499 | 500-509 | 510-511
+        return (
+            "("
+            "[0-9] | "
+            "[1-9] [0-9] | "
+            "[1-4] [0-9] [0-9] | "
+            "\"50\" [0-9] | "
+            "\"51\" [0-1]"
+            ")"
+        )
+    elif min_val == 0 and max_val == 256:
+        # 0-9 | 10-99 | 100-199 | 200-249 | 250-255
+        return (
+            "("
+            "[0-9] | "
+            "[1-9] [0-9] | "
+            "\"1\" [0-9] [0-9] | "
+            "\"2\" [0-4] [0-9] | "
+            "\"25\" [0-5]"
+            ")"
+        )
+    else:
+        raise ValueError(f"Range {min_val}:{max_val} is not supported.")
+
+
+def build_exact_n_numbers_grammar(n_numbers: int, min_val: int, max_val: int) -> str:
     """
     Constructs an EBNF grammar that enforces exactly `n_numbers` integers.
     """
-    # integer ::= "-"? [0-9]+
-    base_rules = """
-    integer ::= "-"? [0-9]+
+    int_pattern = get_range_regex(min_val, max_val)
+    base_rules = f"""
+    integer ::= {int_pattern}
     space ::= " "
     """
 
@@ -258,7 +298,7 @@ class VLA0Local(nn.Module):
         tokenizer_info = xgr.TokenizerInfo.from_huggingface(self.processor.tokenizer)
         self.grammar_compiler = xgr.GrammarCompiler(tokenizer_info)
         total_actions = self.config.chunk_size * self.config.action_feature.shape[0]
-        ebnf_string = build_exact_n_numbers_grammar(total_actions)
+        ebnf_string = build_exact_n_numbers_grammar(total_actions, 0, self.config.n_action_bins)
         self.compiled_grammar = self.grammar_compiler.compile_grammar(ebnf_string)
 
     def apply_action_masking(self, actions: list[list[str]]):
@@ -550,16 +590,10 @@ class VLA0Client(nn.Module):
         if self.do_crop:
             self.center_crop_fn = CenterCrop(config.crop_shape)
 
-        # Connection Setup
-        self.client = OpenAI(
-            base_url=self.config.vllm_url, 
-            api_key=self.config.vllm_api_key
-        )
         self.model_name = "vla-0-smol"
 
-        # Grammar Setup
         total_actions = self.config.chunk_size * self.config.action_feature.shape[0]
-        self.grammar_str = build_exact_n_numbers_grammar(total_actions)
+        self.grammar_str = build_exact_n_numbers_grammar(total_actions, 0, self.config.n_action_bins)
 
         # Dummy param for device management
         self.register_buffer("dummy_param", torch.empty(0))
@@ -577,7 +611,6 @@ class VLA0Client(nn.Module):
         nd_arr = tensor_img.permute(1, 2, 0).cpu().numpy()
         nd_arr = (nd_arr * 255).astype(np.uint8)
 
-        # 3. Encode
         pil_img = Image.fromarray(nd_arr)
         buff = io.BytesIO()
         if format == "PNG":
@@ -586,78 +619,84 @@ class VLA0Client(nn.Module):
             pil_img.save(buff, format="JPEG", quality=95)
         return base64.b64encode(buff.getvalue()).decode('utf-8')
 
-    @torch.no_grad()
-    def generate_actions(self, batch: dict[str, Tensor]) -> Tensor:
+    async def _generate_actions_async(self, batch: dict[str, Tensor]) -> Tensor:
         device = self.dummy_param.device
         batch_size = batch[OBS_STATE].shape[0]
+        
+        bins = torch.linspace(-1.0 - EPS, 1.0 + EPS, self.config.n_state_bins + 1, device=device)
 
-        # NOTE: This implementation currently handles Batch Size = 1 (Standard for Robot Inference)
-        # For larger batches, you would need to use asyncio or loop.
-        if batch_size > 1:
-            logging.warning("VLA0 Client Policy currently optimized for BS=1. Processing sequentially.")
+        async with AsyncOpenAI(
+            base_url=self.config.vllm_url,
+            api_key=self.config.vllm_api_key,
+            max_retries=0, 
+            timeout=30.0,
+        ) as client:
+            sem = asyncio.Semaphore(64)
 
-        actions_list = []
+            async def process_single_sample_async(i):
+                async with sem:
+                    state = batch[OBS_STATE][i]
+                    disc_state = (torch.bucketize(state, bins[:-1]) - 1).cpu().numpy()
+                    state_str = " ".join(map(str, disc_state.tolist()))
 
-        for i in range(batch_size):
-            state = batch[OBS_STATE][i]
-            bins = torch.linspace(-1.0 - EPS, 1.0 + EPS, self.config.n_state_bins + 1, device=device)[:-1]
-            disc_state = (torch.bucketize(state, bins) - 1).cpu().numpy()
-            state_str = " ".join(map(str, disc_state.tolist()))
+                    task_text = batch.get("task", [""]*batch_size)[i]
+                    task_cleaned = task_text.lower().strip().replace("_", " ")
 
-            task_text = batch.get("task", [""]*batch_size)[i]
-            task_cleaned = task_text.lower().strip().replace("_", " ")
+                    if self.config.use_state:
+                        prompt_text = f"Task: {task_cleaned}, State: {state_str}, Actions: "
+                    else:
+                        prompt_text = f"Task: {task_cleaned}, Actions: "
 
-            if self.config.use_state:
-                prompt_text = f"Task: {task_cleaned}, State: {state_str}, Actions: "
-            else:
-                prompt_text = f"Task: {task_cleaned}, Actions: "
+                    content_payload = []
+                    present_img_keys = [k for k in self.image_keys if k in batch]
+                    for key in present_img_keys:
+                        b64_str = self._process_image_to_base64(batch[key][i])
+                        content_payload.append({
+                            "type": "image_url",
+                            "image_url": {"url": f"data:image/png;base64,{b64_str}"}
+                        })
+                    content_payload.append({"type": "text", "text": prompt_text})
 
-            content_payload = []
+                    try:
+                        response = await client.chat.completions.create(
+                            model=self.model_name,
+                            messages=[{"role": "user", "content": content_payload}],
+                            max_tokens=self.config.max_decoding_steps,
+                            temperature=0.0,
+                            extra_body={"guided_grammar": self.grammar_str}
+                        )
+                        generated_text = response.choices[0].message.content
+                    except Exception as e:
+                        logging.error(f"Async vLLM Error sample {i}: {e}")
+                        raise RuntimeError("vLLM Request Failed")
 
-            present_img_keys = [k for k in self.image_keys if k in batch]
-            for key in present_img_keys:
-                b64_str = self._process_image_to_base64(batch[key][i]) 
-                content_payload.append({
-                    "type": "image_url",
-                    "image_url": {"url": f"data:image/png;base64,{b64_str}"}
-                })
+                    n_expected = self.action_horizon * self.action_dim
+                    actions = generated_text.strip().split()
+                    valid_actions = [int(a) for a in actions if a.isdigit()]
 
-            content_payload.append({"type": "text", "text": prompt_text})
+                    if len(valid_actions) != n_expected:
+                        logging.error(actions)
+                        raise RuntimeError(f"Invalid length: {len(valid_actions)} vs {n_expected}")
 
-            try:
-                response = self.client.chat.completions.create(
-                    model=self.model_name,
-                    messages=[{"role": "user", "content": content_payload}],
-                    max_tokens=self.config.max_decoding_steps,
-                    temperature=0.0,
-                    extra_body={"guided_grammar": self.grammar_str}
-                )
-                generated_text = response.choices[0].message.content
-            except Exception as e:
-                logging.error(f"vLLM Server Error: {e}")
-                raise RuntimeError("vLLM Server request failed.")
+                    try:
+                        indices = torch.tensor(valid_actions, device=device).clamp(0, self.config.n_action_bins - 1)
+                    except RuntimeError:
+                        logging.error(valid_actions)
+                        raise RuntimeError("Cannot convert digits to indices.")
 
-            n_expected = self.action_horizon * self.action_dim
-            tokens = generated_text.strip().split()
+                    bin_centers = 0.5 * (bins[:-1] + bins[1:])
+                    action_tensor = bin_centers[indices].view(self.action_horizon, self.action_dim)
 
-            valid_tokens = []
-            for t in tokens:
-                if t.lstrip("-").isdigit():
-                     valid_tokens.append(int(t))
+                    if self.config.relative_actions:
+                        action_tensor = action_tensor + state.unsqueeze(0)
 
-            if len(valid_tokens) != n_expected:
-                raise RuntimeError(f"Server returned invalid length: {len(valid_tokens)} vs {n_expected}")
+                    return action_tensor
 
-            indices = torch.tensor(valid_tokens, device=device).clamp(0, self.config.n_state_bins - 1)
+            tasks = [process_single_sample_async(i) for i in range(batch_size)]
+            results = await asyncio.gather(*tasks)
 
-            bins = torch.linspace(-1.0 - EPS, 1.0 + EPS, self.config.n_state_bins + 1, device=device)
-            bin_centers = 0.5 * (bins[:-1] + bins[1:])
-            action_tensor = bin_centers[indices]
+            return torch.stack(results)
 
-            action_tensor = action_tensor.view(self.action_horizon, self.action_dim)
-
-            if self.config.relative_actions:
-                 action_tensor = action_tensor + state.unsqueeze(0)
-
-            actions_list.append(action_tensor)
-        return torch.stack(actions_list)
+    @torch.no_grad()
+    def generate_actions(self, batch: dict[str, Tensor]) -> Tensor:
+        return asyncio.run(self._generate_actions_async(batch))
