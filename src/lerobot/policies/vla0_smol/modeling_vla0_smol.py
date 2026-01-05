@@ -5,17 +5,34 @@ import random
 from collections import deque
 
 import torch
-import xgrammar as xgr
 from torch import Tensor, nn
 from torch.profiler import record_function
 from torchvision.transforms import CenterCrop, RandomCrop
-from transformers import AutoModelForImageTextToText, AutoProcessor
-from transformers.models.smolvlm.image_processing_smolvlm_fast import SmolVLMImageProcessorFast
 
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.policies.vla0_smol.configuration_vla0_smol import VLA0SmolConfig
-from lerobot.policies.vla0_smol.monkey_patch import patch_SmolVLM_amp, patch_SmolVLMProcessor
 from lerobot.utils.constants import ACTION, OBS_STATE
+from lerobot.policies.vla0_smol.monkey_patch import patch_SmolVLM_amp, patch_SmolVLMProcessor
+
+try:
+    from transformers import AutoModelForImageTextToText, AutoProcessor
+    from transformers.models.smolvlm.image_processing_smolvlm_fast import SmolVLMImageProcessorFast
+    import xgrammar as xgr
+    HAS_LOCAL_DEPS = True
+except ImportError:
+    HAS_LOCAL_DEPS = False
+
+try:
+    from openai import OpenAI
+    import base64
+    import io
+    import numpy as np
+    from PIL import Image
+    
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    HAS_REMOTE_DEPS = True
+except ImportError:
+    HAS_REMOTE_DEPS = False
 
 PRECISION = {
     "float16": torch.float16,
@@ -30,7 +47,7 @@ class VLA0SmolPolicy(PreTrainedPolicy):
     """Wrapper class around VLA0 model to train and run inference within LeRobot."""
 
     config_class = VLA0SmolConfig
-    name = "vla0"
+    name = "vla0_smol"
 
     def __init__(
         self,
@@ -48,7 +65,16 @@ class VLA0SmolPolicy(PreTrainedPolicy):
         super().__init__(config)
         config.validate_features()
         self.config = config
-        self.model = VLA0(config)
+        if self.config.use_vllm_client:
+            logging.info("VLA0 Policy: Initializing in REMOTE CLIENT mode (vLLM).")
+            if not HAS_REMOTE_DEPS:
+                raise ImportError("Please install `openai` and `pillow` for remote inference.")
+            self.model = VLA0Client(config)
+        else:
+            logging.info("VLA0 Policy: Initializing in LOCAL TRAINING mode (PyTorch).")
+            if not HAS_LOCAL_DEPS:
+                raise ImportError("Missing transformers/xgrammar deps for local training.")
+            self.model = VLA0Local(config)
 
         self.use_ensembling = self.config.ensemble_size > 1
         if self.use_ensembling:
@@ -178,7 +204,7 @@ class VLA0TemporalEnsembler:
         return action_to_execute
 
 
-class VLA0(nn.Module):
+class VLA0Local(nn.Module):
     def __init__(self, config: VLA0SmolConfig):
         super().__init__()
         self.config = config
@@ -510,3 +536,128 @@ class VLA0(nn.Module):
         if self.config.relative_actions:
             reconstructed_actions += batch[OBS_STATE].unsqueeze(1)
         return reconstructed_actions
+
+
+class VLA0Client(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+
+        self.action_horizon = self.config.chunk_size
+        self.action_dim = self.config.action_feature.shape[0]
+        self.image_keys = self.config.image_features.keys()
+        self.do_crop = config.crop_shape is not None
+        if self.do_crop:
+            self.center_crop_fn = CenterCrop(config.crop_shape)
+
+        # Connection Setup
+        self.client = OpenAI(
+            base_url=self.config.vllm_url, 
+            api_key=self.config.vllm_api_key
+        )
+        self.model_name = "vla-0-smol"
+
+        # Grammar Setup
+        total_actions = self.config.chunk_size * self.config.action_feature.shape[0]
+        self.grammar_str = build_exact_n_numbers_grammar(total_actions)
+
+        # Dummy param for device management
+        self.register_buffer("dummy_param", torch.empty(0))
+
+    def forward(self, batch):
+        raise NotImplementedError("Client backend cannot be trained. Use use_vllm_client=False.")
+
+    def _process_image_to_base64(self, tensor_img: Tensor, format="PNG") -> str:
+        """
+        Converts a (C, H, W) float tensor to a Base64 encoded string.
+        """
+        if self.do_crop:
+            tensor_img = self.center_crop_fn(tensor_img)
+
+        nd_arr = tensor_img.permute(1, 2, 0).cpu().numpy()
+        nd_arr = (nd_arr * 255).astype(np.uint8)
+
+        # 3. Encode
+        pil_img = Image.fromarray(nd_arr)
+        buff = io.BytesIO()
+        if format == "PNG":
+            pil_img.save(buff, format="PNG", optimize=True) 
+        else:
+            pil_img.save(buff, format="JPEG", quality=95)
+        return base64.b64encode(buff.getvalue()).decode('utf-8')
+
+    @torch.no_grad()
+    def generate_actions(self, batch: dict[str, Tensor]) -> Tensor:
+        device = self.dummy_param.device
+        batch_size = batch[OBS_STATE].shape[0]
+
+        # NOTE: This implementation currently handles Batch Size = 1 (Standard for Robot Inference)
+        # For larger batches, you would need to use asyncio or loop.
+        if batch_size > 1:
+            logging.warning("VLA0 Client Policy currently optimized for BS=1. Processing sequentially.")
+
+        actions_list = []
+
+        for i in range(batch_size):
+            state = batch[OBS_STATE][i]
+            bins = torch.linspace(-1.0 - EPS, 1.0 + EPS, self.config.n_state_bins + 1, device=device)[:-1]
+            disc_state = (torch.bucketize(state, bins) - 1).cpu().numpy()
+            state_str = " ".join(map(str, disc_state.tolist()))
+
+            task_text = batch.get("task", [""]*batch_size)[i]
+            task_cleaned = task_text.lower().strip().replace("_", " ")
+
+            if self.config.use_state:
+                prompt_text = f"Task: {task_cleaned}, State: {state_str}, Actions: "
+            else:
+                prompt_text = f"Task: {task_cleaned}, Actions: "
+
+            content_payload = []
+
+            present_img_keys = [k for k in self.image_keys if k in batch]
+            for key in present_img_keys:
+                b64_str = self._process_image_to_base64(batch[key][i]) 
+                content_payload.append({
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/png;base64,{b64_str}"}
+                })
+
+            content_payload.append({"type": "text", "text": prompt_text})
+
+            try:
+                response = self.client.chat.completions.create(
+                    model=self.model_name,
+                    messages=[{"role": "user", "content": content_payload}],
+                    max_tokens=self.config.max_decoding_steps,
+                    temperature=0.0,
+                    extra_body={"guided_grammar": self.grammar_str}
+                )
+                generated_text = response.choices[0].message.content
+            except Exception as e:
+                logging.error(f"vLLM Server Error: {e}")
+                raise RuntimeError("vLLM Server request failed.")
+
+            n_expected = self.action_horizon * self.action_dim
+            tokens = generated_text.strip().split()
+
+            valid_tokens = []
+            for t in tokens:
+                if t.lstrip("-").isdigit():
+                     valid_tokens.append(int(t))
+
+            if len(valid_tokens) != n_expected:
+                raise RuntimeError(f"Server returned invalid length: {len(valid_tokens)} vs {n_expected}")
+
+            indices = torch.tensor(valid_tokens, device=device).clamp(0, self.config.n_state_bins - 1)
+
+            bins = torch.linspace(-1.0 - EPS, 1.0 + EPS, self.config.n_state_bins + 1, device=device)
+            bin_centers = 0.5 * (bins[:-1] + bins[1:])
+            action_tensor = bin_centers[indices]
+
+            action_tensor = action_tensor.view(self.action_horizon, self.action_dim)
+
+            if self.config.relative_actions:
+                 action_tensor = action_tensor + state.unsqueeze(0)
+
+            actions_list.append(action_tensor)
+        return torch.stack(actions_list)
