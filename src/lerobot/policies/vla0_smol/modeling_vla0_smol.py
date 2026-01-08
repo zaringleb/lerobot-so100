@@ -3,6 +3,7 @@
 import logging
 import random
 from collections import deque
+import copy
 
 import torch
 import xgrammar as xgr
@@ -11,7 +12,12 @@ from torch.profiler import record_function
 from torchvision.transforms import CenterCrop, RandomCrop
 from transformers import AutoModelForImageTextToText, AutoProcessor
 from transformers.models.smolvlm.image_processing_smolvlm_fast import SmolVLMImageProcessorFast
-
+from transformers.models.llama.modeling_llama import LlamaDecoderLayer
+from transformers.masking_utils import create_causal_mask
+from transformers.cache_utils import DynamicCache
+from transformers.modeling_outputs import (
+    BaseModelOutputWithPast,
+)
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.policies.vla0_smol.configuration_vla0_smol import VLA0SmolConfig
 from lerobot.policies.vla0_smol.monkey_patch import patch_SmolVLM_amp, patch_SmolVLMProcessor
@@ -178,6 +184,92 @@ class VLA0TemporalEnsembler:
 
         return action_to_execute
 
+class EagleModel(nn.Module):
+    def __init__(self, text_model):
+        super().__init__()
+        self.draft_cfg = copy.deepcopy(text_model.config)
+
+        print(f"text config: {self.draft_cfg}")
+
+        self.embed = text_model.get_input_embeddings()
+        self.lm_head = text_model.get_output_embeddings()
+
+        self.norm = text_model.model.norm
+        self.rotary_emb = text_model.model.norm.rotary_emb
+
+        hidden_size = self.draft_cfg.hidden_size
+        self.fuse_fc = nn.Linear(2 * hidden_size, hidden_size, bias=False)
+
+        self.decoder_layer = LlamaDecoderLayer(self.draft_cfg, layer_idx=0)
+
+        # --- losses / hyperparams (same as before)
+        self.w_cls = 0.1
+        self.feat_noise = 0.1
+
+
+    def forward(self,
+                input_ids,
+                hidden_states,
+                attention_mask,
+                position_ids,
+                past_key_values = None,
+                use_cache = False,
+                cache_position = None,
+                ):
+        """
+        tokens: [B, seq_len]
+        hidden_state: [B, seq_len, hidden_size]
+        attn_maks: [B, seq_len]
+        """
+
+        inputs_embeds = self.embed(input_ids) # [B, seq_len, hidden_size]
+        inputs_embeds = inputs_embeds.to(hidden_states.device)
+
+        if use_cache and past_key_values is None:
+            past_key_values = DynamicCache(config=self.draft_cfg)
+
+        if cache_position is None:
+            past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
+            cache_position: torch.Tensor = torch.arange(
+                past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
+            )
+
+        if position_ids is None:
+            position_ids = cache_position.unsqueeze(0)
+
+        causal_mask = create_causal_mask(
+            config=self.draft_cfg,
+            input_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            cache_position=cache_position,
+            past_key_values=past_key_values,
+            position_ids=position_ids,
+        )
+        position_embeddings = self.rotary_emb(hidden_states, position_ids)
+
+
+        if self.training and self.feat_noise > 0:
+            noise = (2.0 * torch.rand_like(hidden_states) - 1.0) * self.feat_noise
+            hidden_states = hidden_states + noise
+
+        hidden_states = torch.cat((hidden_states, inputs_embeds), dim = -1)
+        hidden_states = self.fuse_fc(hidden_states)
+
+        hidden_states = self.decoder_layer(
+                hidden_states,
+                attention_mask=causal_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                cache_position=cache_position,
+                position_embeddings=position_embeddings,
+            )
+
+        hidden_states = self.norm(hidden_states)
+
+        return BaseModelOutputWithPast(
+            last_hidden_state=hidden_states,
+            past_key_values=past_key_values,
+        )
 
 class VLA0(nn.Module):
     def __init__(self, config: VLA0SmolConfig):
@@ -244,6 +336,10 @@ class VLA0(nn.Module):
         self.num_actions_generated = None
         self.action_index = 0
         self.generation_batch = None
+
+        # speculation
+        self.eagle_model = EagleModel(self.vlm.model.text_model)
+
 
     def apply_action_masking(self, actions: list[list[str]]):
         if not self.training:
@@ -418,26 +514,42 @@ class VLA0(nn.Module):
                 attention_mask=padded_outs["attention_mask"],
                 pixel_values=padded_outs["pixel_values"],
                 pixel_attention_mask=padded_outs["pixel_attention_mask"],
-                use_cache=self.config.use_cache,
+                use_cache=False,
+                output_hidden_states=True,
+                return_dict=True,
             )
 
             # ? # should we train together main model and speculator head # ? #
 
             # <START>
-
+        with record_function("eagle_forward"):
             # get last hidden layer [bs, seq_len, hidden_dim]
-            f = None
-            # get targets embedings [bs, seq_len, hidden_dim]
-            e = None
-            de = torch.cat([f,e], dim=-1) # [bs, seq_len, 2 * hidden_dim]
-            spec_fc = None # spec_fc = nn.Linear(2 * hidden_dim, hidden_dim)
-            de_hidden = spec_fc(de) # [bs, seq_len, hidden_dim]
-            spec_head = None # spec head is a layer from text model (find a way to copy ?)
-            f_spec = spec_head(de_hidden) # [bs, seq_len, hidden_dim]
-            lm_head = None # it should be something like self.vlm.model.text_model.lm_head
-            logits_spec = lm_head(f_spec) # [bs, seq_len, vocab_size]
+            teacher_hidden_state = outputs.last_hidden_state[:, :-1, :] # [batch_size, seq_len - 1, hidden_size]
+            input_ids = padded_outs["input_ids"][:, 1:] # [batch_size, seq_len - 1]
+            attn_mask = padded_outs["attention_mask"][:, 1:]  # [batch_size, seq_len - 1]
 
-            # <STOP>
+            eagle_output = self.eagle_model(input_ids = input_ids,
+                                            hidden_states = teacher_hidden_state,
+                                            attention_mask = attn_mask,
+                                            position_ids = None,
+                                            past_key_values = None,
+                                            use_cache = False,
+                                            cache_position = None,
+                                            )
+        
+        with record_function("eagle_loss"):
+            # regularisation loss
+            eagle_hidden_state = eagle_output.last_hidden_state
+            target_hidden_state = outputs.logits[:, 1:, :] # [batch_size, seq_len - 1, hidden_size]
+
+            reg_loss = nn.functional.smooth_l1_loss(eagle_hidden_state, target_hidden_state)
+
+            # classifiaction loss
+            eagle_logits = self.eagle_model.lm_head(self.eagle_model.norm(eagle_hidden_state))
+            teacher_logits = padded_outs["input_ids"][:, 1:].to(device)  # ????????? maybe shift 2 ?????????
+            cls_loss = nn.functional.cross_entropy(eagle_logits.reshape(-1, eagle_logits.shape[-1]), teacher_logits.reshape(-1))
+
+            spec_loss = reg_loss + 0.1 * cls_loss 
 
         with record_function("loss"):
             logits = outputs.logits
@@ -455,18 +567,6 @@ class VLA0(nn.Module):
 
             # Apply loss mask
             token_loss = token_loss * loss_mask.reshape(-1)
-
-            # <START>
-
-            # regressin loss
-            loss_reg = nn.functional.smooth_l1_loss(f_spec, f)
-
-            loss_cls_fct = nn.CrossEntropyLoss(reduction="mean")
-            loss_cls = loss_cls_fct(logits_spec.reshape(-1, logits_spec.shape[-1]), targets.reshape(-1))
-
-            spec_loss = loss_reg + 0.1 * loss_cls 
-
-            # <STOP>
 
             # Compute final loss
             loss = token_loss.sum() / torch.clamp(loss_mask.sum(), min=1) + spec_loss
