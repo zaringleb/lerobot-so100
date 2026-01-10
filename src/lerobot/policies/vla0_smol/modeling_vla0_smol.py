@@ -336,6 +336,7 @@ class VLA0(nn.Module):
         self.num_actions_generated = None
         self.action_index = 0
         self.generation_batch = None
+        self.last_tokens = None
 
         # speculation
         if config.eagle:
@@ -575,7 +576,7 @@ class VLA0(nn.Module):
             target_hidden_state = outputs.logits[:, 1:, :] # [batch_size, seq_len - 1, hidden_size]
 
             reg_loss_fct = nn.SmoothL1Loss()
-            
+
             # ?????? should we use loss mask here ?????????
             reg_loss = reg_loss_fct(eagle_hidden_state, target_hidden_state)
 
@@ -604,9 +605,9 @@ class VLA0(nn.Module):
 
         return loss_dict
     
-    def generate_next_token(self, last_token, past_key_values):
+    def generate_next_token(self, last_tokens, past_key_values):
         with torch.no_grad():
-            out = self.vlm(input_ids=last_token,
+            out = self.vlm(input_ids=last_tokens,
                            past_key_values=past_key_values,
                            use_cache=True)
         generated_token = out.logits[:, -1, :].argmax(-1, keepdim=True)
@@ -669,7 +670,9 @@ class VLA0(nn.Module):
             # ---- PREFILL AND FIRST TOKEN----
             with torch.inference_mode():
                 out = self.vlm(**padded_outs, use_cache=True)
-            generated_token = out.logits[:, -1, :].argmax(-1, keepdim=True)
+            generated_token = out.logits[:, -1, :].argmax(-1, keepdim=True) # [batch_size, 1]
+
+            self.last_tokens = generated_token
             self.generated_tokens.append(generated_token)
             self.past_key_values = out.past_key_values
 
@@ -679,14 +682,35 @@ class VLA0(nn.Module):
         # generate one action
         num_remained_tokens = self.config.max_decoding_steps - len(self.generated_tokens)
         for _ in range(num_remained_tokens):
-            generated_token, past_key_values = self.generate_next_token(last_token=self.generated_tokens[-1],
+            generated_token, past_key_values = self.generate_next_token(last_tokens=self.last_tokens,
                                                                         past_key_values=self.past_key_values)
+            
+            self.last_tokens = generated_token
             self.generated_tokens.append(generated_token)
             self.past_key_values = past_key_values
 
             #check end of generation
             if self.check_end_of_generation(generated_token):
                 self.new_obs = True
+
+            # <SPECULATION INFERNCE START>
+
+            # !!!!!!!!!! as a first step we generate without verification !!!!!!!!!!!!!!!
+
+            proposed_tokens = []
+            for i in range(self.config.num_spec_tokens):
+                # generate next token eagle
+                generated_token = None
+                proposed_tokens.append(generated_token)
+
+                #check end of generation
+                if self.check_end_of_generation(generated_token):
+                    self.new_obs = True
+                    break
+
+            self.last_tokens = torch.cat(proposed_tokens,dim=-1)
+            self.generated_tokens.extend(proposed_tokens)
+            # <SPECULATION INFERENCE STOP>
             
             # decode every new sequence and count amount of spaces 
             tokens_pt = torch.cat(self.generated_tokens,dim=-1)
