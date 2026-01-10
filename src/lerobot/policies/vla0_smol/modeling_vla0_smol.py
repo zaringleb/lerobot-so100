@@ -338,7 +338,8 @@ class VLA0(nn.Module):
         self.generation_batch = None
 
         # speculation
-        self.eagle_model = EagleModel(self.vlm.model.text_model)
+        if config.eagle:
+            self.eagle_model = EagleModel(self.vlm.model.text_model)
 
 
     def apply_action_masking(self, actions: list[list[str]]):
@@ -519,9 +520,35 @@ class VLA0(nn.Module):
                 return_dict=True,
             )
 
-            # ? # should we train together main model and speculator head # ? #
+        with record_function("loss"):
+            logits = outputs.logits
+            logits = logits.to(torch.float32)
 
-            # <START>
+            loss_fct = nn.CrossEntropyLoss(reduction="none")
+
+            # Shift left for next-step prediction
+            logits = logits[:, :-1, :]
+            targets = padded_outs["input_ids"][:, 1:].to(device)  # Shift targets
+            loss_mask = loss_mask[:, 1:].to(device)  # Ensure correct shape
+
+            # Compute per-token loss
+            token_loss = loss_fct(logits.reshape(-1, logits.shape[-1]), targets.reshape(-1))
+
+            # Apply loss mask
+            token_loss = token_loss * loss_mask.reshape(-1)
+
+            # Compute final loss
+            loss = token_loss.sum() / torch.clamp(loss_mask.sum(), min=1)
+
+        if not self.config.eagle:
+            # Return loss dictionary
+            loss_dict = {
+                "ce_loss": loss.item(),
+                "loss": loss,
+                "sequence_len": padded_outs["input_ids"].shape[-1],
+            }
+            return loss_dict
+
         with record_function("eagle_forward"):
             # get last hidden layer [bs, seq_len, hidden_dim]
 
@@ -547,36 +574,26 @@ class VLA0(nn.Module):
             # target hifdden state: F_{2:i}
             target_hidden_state = outputs.logits[:, 1:, :] # [batch_size, seq_len - 1, hidden_size]
 
-            reg_loss = nn.functional.smooth_l1_loss(eagle_hidden_state, target_hidden_state)
+            reg_loss_fct = nn.SmoothL1Loss()
+            
+            # ?????? should we use loss mask here ?????????
+            reg_loss = reg_loss_fct(eagle_hidden_state, target_hidden_state)
 
             # classifiaction loss
+            eagle_loss_fct = nn.CrossEntropyLoss(reduction="none")
+
             eagle_logits = self.eagle_model.lm_head(self.eagle_model.norm(eagle_hidden_state))
             teacher_logits = padded_outs["input_ids"][:, 1:].to(device)
-            cls_loss = nn.functional.cross_entropy(eagle_logits.reshape(-1, eagle_logits.shape[-1]), teacher_logits.reshape(-1))
-
-            spec_loss = reg_loss + 0.1 * cls_loss 
-
-        with record_function("loss"):
-            logits = outputs.logits
-            logits = logits.to(torch.float32)
-
-            loss_fct = nn.CrossEntropyLoss(reduction="none")
-
-            # Shift left for next-step prediction
-            logits = logits[:, :-1, :]
-            targets = padded_outs["input_ids"][:, 1:].to(device)  # Shift targets
-            loss_mask = loss_mask[:, 1:].to(device)  # Ensure correct shape
-
-            # Compute per-token loss
-            token_loss = loss_fct(logits.reshape(-1, logits.shape[-1]), targets.reshape(-1))
-
+            cls_loss = eagle_loss_fct(eagle_logits.reshape(-1, eagle_logits.shape[-1]), teacher_logits.reshape(-1))
+            
             # Apply loss mask
-            token_loss = token_loss * loss_mask.reshape(-1)
+            cls_loss = cls_loss * loss_mask.reshape(-1)
 
             # Compute final loss
-            loss = token_loss.sum() / torch.clamp(loss_mask.sum(), min=1) + spec_loss
+            cls_loss = cls_loss.sum() / torch.clamp(loss_mask.sum(), min=1)
 
-            # Return loss dictionary
+            loss += reg_loss + 0.1 * cls_loss 
+
             loss_dict = {
                 "ce_loss": loss.item(),
                 "reg_loss_eagle": reg_loss.item(),
