@@ -524,8 +524,12 @@ class VLA0(nn.Module):
             # <START>
         with record_function("eagle_forward"):
             # get last hidden layer [bs, seq_len, hidden_dim]
+
+            # teacher hidden state: F_{1:i-1}
             teacher_hidden_state = outputs.last_hidden_state[:, :-1, :] # [batch_size, seq_len - 1, hidden_size]
+            # input tokens: T_{2:i}
             input_ids = padded_outs["input_ids"][:, 1:] # [batch_size, seq_len - 1]
+
             attn_mask = padded_outs["attention_mask"][:, 1:]  # [batch_size, seq_len - 1]
 
             eagle_output = self.eagle_model(input_ids = input_ids,
@@ -539,14 +543,15 @@ class VLA0(nn.Module):
         
         with record_function("eagle_loss"):
             # regularisation loss
-            eagle_hidden_state = eagle_output.last_hidden_state
+            eagle_hidden_state = eagle_output.last_hidden_state # [batch_size, seq_len - 1, hidden_size]
+            # target hifdden state: F_{2:i}
             target_hidden_state = outputs.logits[:, 1:, :] # [batch_size, seq_len - 1, hidden_size]
 
             reg_loss = nn.functional.smooth_l1_loss(eagle_hidden_state, target_hidden_state)
 
             # classifiaction loss
             eagle_logits = self.eagle_model.lm_head(self.eagle_model.norm(eagle_hidden_state))
-            teacher_logits = padded_outs["input_ids"][:, 1:].to(device)  # ????????? maybe shift 2 ?????????
+            teacher_logits = padded_outs["input_ids"][:, 1:].to(device)
             cls_loss = nn.functional.cross_entropy(eagle_logits.reshape(-1, eagle_logits.shape[-1]), teacher_logits.reshape(-1))
 
             spec_loss = reg_loss + 0.1 * cls_loss 
@@ -574,10 +579,11 @@ class VLA0(nn.Module):
             # Return loss dictionary
             loss_dict = {
                 "ce_loss": loss.item(),
+                "reg_loss_eagle": reg_loss.item(),
+                "cls_loss_eagle": cls_loss.item(),
                 "loss": loss,
                 "sequence_len": padded_outs["input_ids"].shape[-1],
             }
-
 
         return loss_dict
     
