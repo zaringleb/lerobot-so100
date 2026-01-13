@@ -61,6 +61,7 @@ batch = preprocessor(raw_batch)
 for step in tqdm(range(50)):
     # batch = {k: (v.to(device) if isinstance(v, torch.Tensor) else v) for k, v in batch.items()}
     loss, loss_dict = policy.forward(batch)
+    vlm_loss = loss_dict["vlm_loss"]
     reg_loss_eagle = loss_dict["reg_loss_eagle"]
     cls_loss_eagle = loss_dict["cls_loss_eagle"]
 
@@ -68,7 +69,7 @@ for step in tqdm(range(50)):
     optimizer.step()
     optimizer.zero_grad()
 
-    print(f"step: {step} loss: {loss.item():.3f}"
+    print(f"step: {step} loss: {vlm_loss:.3f}"
           f" reg_loss_eagle: {reg_loss_eagle:.3f}"
           f" cls_loss_eagle: {cls_loss_eagle:.3f}")
 

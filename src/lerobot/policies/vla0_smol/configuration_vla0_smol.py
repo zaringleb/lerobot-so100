@@ -14,7 +14,7 @@ class VLA0SmolConfig(PreTrainedConfig):
     # Input / output structure.
     n_obs_steps: int = 1
     chunk_size: int = 10
-    n_action_steps: int = 5
+    n_action_steps: int = 10
     ensemble_size: int = 0
 
     normalization_mapping: dict[str, NormalizationMode] = field(
@@ -57,8 +57,8 @@ class VLA0SmolConfig(PreTrainedConfig):
     start_actions_token: int = 49279
 
     grad_clip_norm: float = 1.0
-    action_mask_aug_per: float = 0.1
-    action_mask_skip_per: float = 0.1
+    action_mask_aug_per: float = 0.0
+    action_mask_skip_per: float = 1.0
 
     action_streaming: bool = False
     eagle: bool = True

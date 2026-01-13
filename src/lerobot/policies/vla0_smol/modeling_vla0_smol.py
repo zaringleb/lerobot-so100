@@ -185,17 +185,16 @@ class VLA0TemporalEnsembler:
         return action_to_execute
 
 class EagleModel(nn.Module):
-    def __init__(self, text_model):
+    def __init__(self, vlm):
         super().__init__()
+        text_model = vlm.model.text_model
         self.draft_cfg = copy.deepcopy(text_model.config)
 
-        print(f"text config: {self.draft_cfg}")
+        self.embed = vlm.get_input_embeddings()
+        self.lm_head = vlm.get_output_embeddings()
 
-        self.embed = text_model.get_input_embeddings()
-        self.lm_head = text_model.get_output_embeddings()
-
-        self.norm = text_model.model.norm
-        self.rotary_emb = text_model.model.norm.rotary_emb
+        self.norm = text_model.norm
+        self.rotary_emb = text_model.rotary_emb
 
         hidden_size = self.draft_cfg.hidden_size
         self.fuse_fc = nn.Linear(2 * hidden_size, hidden_size, bias=False)
@@ -360,7 +359,7 @@ class VLA0(nn.Module):
 
         # speculation
         if config.eagle:
-            self.eagle_model = EagleModel(self.vlm.model.text_model)
+            self.eagle_model = EagleModel(self.vlm)
             self.hidden_state = None
 
 
@@ -560,22 +559,22 @@ class VLA0(nn.Module):
             token_loss = token_loss * loss_mask.reshape(-1)
 
             # Compute final loss
-            loss = token_loss.sum() / torch.clamp(loss_mask.sum(), min=1)
+            vlm_loss = token_loss.sum() / torch.clamp(loss_mask.sum(), min=1)
 
         if not self.config.eagle:
             # Return loss dictionary
             loss_dict = {
-                "ce_loss": loss.item(),
-                "loss": loss,
+                "vlm_loss": vlm_loss.item(),
+                "loss": vlm_loss,
                 "sequence_len": padded_outs["input_ids"].shape[-1],
             }
             return loss_dict
 
         with record_function("eagle_forward"):
             # get last hidden layer [bs, seq_len, hidden_dim]
-
+            teacher_output = outputs.hidden_states[-1]
             # teacher hidden state: F_{1:i-1}
-            teacher_hidden_state = outputs.last_hidden_state[:, :-1, :].detach() # [batch_size, seq_len - 1, hidden_size]
+            teacher_hidden_state = teacher_output[:, :-1, :].detach() # [batch_size, seq_len - 1, hidden_size]
             # input tokens: T_{2:i}
             input_ids = padded_outs["input_ids"][:, 1:] # [batch_size, seq_len - 1]
 
@@ -594,7 +593,7 @@ class VLA0(nn.Module):
             # regularisation loss
             eagle_hidden_state = eagle_output.last_hidden_state # [batch_size, seq_len - 1, hidden_size]
             # target hifdden state: F_{2:i}
-            target_hidden_state = outputs.last_hidden_state[:, 1:, :].detach() # [batch_size, seq_len - 1, hidden_size]
+            target_hidden_state = teacher_output[:, 1:, :].detach() # [batch_size, seq_len - 1, hidden_size]
 
             reg_loss_fct = nn.SmoothL1Loss()
 
@@ -603,7 +602,6 @@ class VLA0(nn.Module):
 
             # classifiaction loss
             eagle_loss_fct = nn.CrossEntropyLoss(reduction="none")
-
             eagle_logits = self.eagle_model.lm_head(self.eagle_model.norm(eagle_hidden_state))
             teacher_logits = padded_outs["input_ids"][:, 1:].to(device)
             cls_loss = eagle_loss_fct(eagle_logits.reshape(-1, eagle_logits.shape[-1]), teacher_logits.reshape(-1))
@@ -614,10 +612,10 @@ class VLA0(nn.Module):
             # Compute final loss
             cls_loss = cls_loss.sum() / torch.clamp(loss_mask.sum(), min=1)
 
-            loss += reg_loss + 0.1 * cls_loss 
+            loss = vlm_loss + reg_loss + 0.1 * cls_loss 
 
             loss_dict = {
-                "ce_loss": loss.item(),
+                "vlm_loss": vlm_loss.item(),
                 "reg_loss_eagle": reg_loss.item(),
                 "cls_loss_eagle": cls_loss.item(),
                 "loss": loss,
