@@ -281,13 +281,13 @@ class EagleModel(nn.Module):
                               position_ids = None,
                               past_key_values = None,
                               use_cache = False,
-                              cache_position = None,
+                              cache_position = None
                               )
         hidden_state = output.last_hidden_state # [batch_size, seq_len - 1, hidden_size]
         logits = self.lm_head(self.norm(hidden_state)) # [batch_size, seq_len - 1, vocab_size]
         generated_token = logits[:, -1, :].argmax(-1, keepdim=True)
 
-        return generated_token
+        return generated_token, hidden_state
 
 
 class VLA0(nn.Module):
@@ -361,6 +361,7 @@ class VLA0(nn.Module):
         if config.eagle:
             self.eagle_model = EagleModel(self.vlm)
             self.hidden_state = None
+            self.prompt = None
 
 
     def apply_action_masking(self, actions: list[list[str]]):
@@ -628,6 +629,7 @@ class VLA0(nn.Module):
         with torch.no_grad():
             out = self.vlm(input_ids=last_tokens,
                            past_key_values=past_key_values,
+                           output_hidden_states=True,
                            use_cache=True)
         generated_token = out.logits[:, -1, :].argmax(-1, keepdim=True)
         return generated_token, out
@@ -688,10 +690,13 @@ class VLA0(nn.Module):
 
             # ---- PREFILL AND FIRST TOKEN----
             with torch.inference_mode():
-                out = self.vlm(**padded_outs, use_cache=True)
+                out = self.vlm(**padded_outs,
+                               use_cache=True,
+                               output_hidden_states=True)
             generated_token = out.logits[:, -1, :].argmax(-1, keepdim=True) # [batch_size, 1]
             if self.config.eagle:
-                self.hidden_state = out.last_hidden_state # [batch_size, seq_len, hidden_size]
+                self.hidden_state = out.hidden_states[-1] # [batch_size, seq_len, hidden_size]
+                self.prompt = padded_outs["input_ids"]
 
             self.last_tokens = generated_token
             self.generated_tokens.append(generated_token)
@@ -704,9 +709,9 @@ class VLA0(nn.Module):
         num_remained_tokens = self.config.max_decoding_steps - len(self.generated_tokens)
         for _ in range(num_remained_tokens):
             generated_token, output = self.generate_next_token(last_tokens=self.last_tokens,
-                                                                        past_key_values=self.past_key_values)
+                                                               past_key_values=self.past_key_values)
             if self.config.eagle:
-                self.hidden_state = torch.cat((self.hidden_state, output.last_hidden_state), dim=1) # [batch_size, seq_len, hidden_size]
+                self.hidden_state = torch.cat((self.hidden_state, output.hidden_states[-1][:,-1:,:]), dim=1) # [batch_size, seq_len, hidden_size]
             
             self.last_tokens = generated_token
             self.generated_tokens.append(generated_token)
@@ -722,14 +727,15 @@ class VLA0(nn.Module):
 
                 proposed_tokens = []
                 for i in range(self.config.num_spec_tokens):
-                    input_ids = torch.cat(self.generated_tokens,dim=-1) # [batch_size, seq_len]
+                    input_ids = torch.cat((self.prompt[:,1:],*self.generated_tokens), dim = 1) # [batch_size, seq_len]
                     attn_mask = torch.ones_like(input_ids)
-
+                    print(input_ids.shape, self.hidden_state.shape)
                     generated_token, hidden_state = self.eagle_model.generate_next_token(input_ids=input_ids,
                                                                                          hidden_state=self.hidden_state,
                                                                                          attn_mask=attn_mask)
-                    self.hidden_state = torch.cat((self.hidden_state, hidden_state), dim=1) # [batch_size, seq_len, hidden_size]
+                    self.hidden_state = torch.cat((self.hidden_state, hidden_state[:,-1:,:]), dim=1) # [batch_size, seq_len, hidden_size]
                     #check end of generation
+                    proposed_tokens.append(generated_token)
                     if self.check_end_of_generation(generated_token):
                         self.new_obs = True
                         break
