@@ -37,7 +37,7 @@ dataset = LeRobotDataset(DATASET_PATH, delta_timestamps=delta_timestamps)
 dataloader = torch.utils.data.DataLoader(
     dataset,
     num_workers=0,
-    batch_size=1,
+    batch_size=16,
     shuffle=True,
     pin_memory=device.type != "cpu",
     drop_last=True,
@@ -58,18 +58,18 @@ raw_batch = next(dl_iter)
 batch = preprocessor(raw_batch)
 
 # %%
-for step in tqdm(range(100)):
+for step in tqdm(range(200)):
     # batch = {k: (v.to(device) if isinstance(v, torch.Tensor) else v) for k, v in batch.items()}
     loss, loss_dict = policy.forward(batch)
     vlm_loss = loss_dict["vlm_loss"]
-    cls_loss_eagle = loss_dict["cls_loss_eagle"]
+    eagle_loss = loss_dict["eagle_loss"]
 
     loss.backward()
     optimizer.step()
     optimizer.zero_grad()
 
     print(f"step: {step} loss: {vlm_loss:.3f}"
-          f" cls_loss_eagle: {cls_loss_eagle:.3f}")
+          f" eagle_loss: {eagle_loss:.3f}")
 
 # %% [markdown]
 # 

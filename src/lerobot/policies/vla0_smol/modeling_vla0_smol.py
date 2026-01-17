@@ -201,10 +201,6 @@ class EagleModel(nn.Module):
 
         self.decoder_layer = LlamaDecoderLayer(self.draft_cfg, layer_idx=0)
 
-        # --- losses / hyperparams (same as before)
-        self.w_cls = 0.1
-        self.feat_noise = 0.0
-
 
     def forward(self,
                 input_ids,
@@ -245,11 +241,6 @@ class EagleModel(nn.Module):
             position_ids=position_ids,
         )
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
-
-
-        if self.training and self.feat_noise > 0:
-            noise = (2.0 * torch.rand_like(hidden_states) - 1.0) * self.feat_noise
-            hidden_states = hidden_states + noise
 
         hidden_states = torch.cat((hidden_states, inputs_embeds), dim = -1)
         hidden_states = self.fuse_fc(hidden_states)
@@ -592,21 +583,13 @@ class VLA0(nn.Module):
                                             )
         
         with record_function("eagle_loss"):
-            # regularisation loss
             eagle_hidden_state = eagle_output.last_hidden_state[:,:-1,:] # [batch_size, seq_len - 1, hidden_size]
-            # target hifdden state: F_{2:i}
-            # target_hidden_state = teacher_output[:, 1:, :].detach() # [batch_size, seq_len - 1, hidden_size]
-
-            # reg_loss_fct = nn.SmoothL1Loss()
-
-            # # ?????? should we use loss mask here ?????????
-            # reg_loss = reg_loss_fct(eagle_hidden_state, target_hidden_state)
 
             # classifiaction loss
             eagle_loss_fct = nn.CrossEntropyLoss(reduction="none")
             eagle_logits = self.eagle_model.lm_head(self.eagle_model.norm(eagle_hidden_state))
             teacher_logits = padded_outs["input_ids"][:, 2:].to(device)
-            # print(eagle_logits.shape, teacher_logits.shape)
+
             cls_loss = eagle_loss_fct(eagle_logits.reshape(-1, eagle_logits.shape[-1]), teacher_logits.reshape(-1))
             
             # Apply loss mask
@@ -616,12 +599,11 @@ class VLA0(nn.Module):
             # Compute final loss
             cls_loss = cls_loss.sum() / torch.clamp(loss_mask_eagle.sum(), min=1)
 
-            loss = vlm_loss + cls_loss #+ reg_loss 
+            loss = vlm_loss + cls_loss
 
             loss_dict = {
                 "vlm_loss": vlm_loss.item(),
-                # "reg_loss_eagle": reg_loss.item(),
-                "cls_loss_eagle": cls_loss.item(),
+                "eagle_loss": cls_loss.item(),
                 "loss": loss,
                 "sequence_len": padded_outs["input_ids"].shape[-1],
             }
@@ -685,7 +667,6 @@ class VLA0(nn.Module):
                 lang_text=self.generation_batch.get("task", ""),
                 actions=None,
             )
-            # print(padded_outs)
             self.prefill_outputs = padded_outs
 
             self.generated_tokens = []
@@ -696,20 +677,18 @@ class VLA0(nn.Module):
             # ---- PREFILL AND FIRST TOKEN----
             with torch.inference_mode():
                 out = self.vlm(**padded_outs,
-                               use_cache=True,
+                               use_cache=False,
                                output_hidden_states=True)
+
             generated_token = out.logits[:, -1, :].argmax(-1, keepdim=True) # [batch_size, 1]
+
             self.prefill_outputs["input_ids"] = torch.cat([self.prefill_outputs["input_ids"], generated_token], dim = -1)
-            next_attention = torch.ones_like(generated_token, device = generated_token.device)
-            self.prefill_outputs["attention_mask"] = torch.cat([self.prefill_outputs["attention_mask"], next_attention], dim = -1)
+            self.prefill_outputs["attention_mask"] = torch.ones_like(self.prefill_outputs["input_ids"])
             
             if self.config.eagle:
                 self.hidden_state = out.hidden_states[-1] # [batch_size, seq_len, hidden_size]
-                
 
-            self.last_tokens = generated_token
             self.generated_tokens.append(generated_token)
-            self.past_key_values = out.past_key_values
 
         next_action_is_generated = [False]*batch_size
         decoded_actions = [None]*batch_size
@@ -719,19 +698,18 @@ class VLA0(nn.Module):
         for _ in range(num_remained_tokens):
             with torch.inference_mode():
                 out = self.vlm(**self.prefill_outputs,
-                               use_cache=True,
+                               use_cache=False,
                                output_hidden_states=True)
+
             generated_token = out.logits[:, -1, :].argmax(-1, keepdim=True) # [batch_size, 1]
+
             self.prefill_outputs["input_ids"] = torch.cat([self.prefill_outputs["input_ids"], generated_token], dim = -1)
-            next_attention = torch.ones_like(generated_token, device = generated_token.device)
-            self.prefill_outputs["attention_mask"] = torch.cat([self.prefill_outputs["attention_mask"], next_attention], dim = -1)
+            self.prefill_outputs["attention_mask"] = torch.ones_like(self.prefill_outputs["input_ids"])
 
             if self.config.eagle:
                 self.hidden_state = torch.cat((self.hidden_state, out.hidden_states[-1][:,-1:,:]), dim=1) # [batch_size, seq_len, hidden_size]
             
-            self.last_tokens = generated_token
             self.generated_tokens.append(generated_token)
-            self.past_key_values = out.past_key_values
 
             #check end of generation
             if self.check_end_of_generation(generated_token):
@@ -743,24 +721,21 @@ class VLA0(nn.Module):
 
                 proposed_tokens = []
                 for i in range(self.config.num_spec_tokens):
-                    # input_ids = torch.cat((self.prompt[:,1:],*self.generated_tokens), dim = 1) # [batch_size, seq_len]
-                    # attn_mask = torch.ones_like(input_ids)
-                    # print(self.prefill_outputs["input_ids"].shape, self.hidden_state.shape)
+
                     generated_token, hidden_state = self.eagle_model.generate_next_token(input_ids=self.prefill_outputs["input_ids"][:,1:],
                                                                                          hidden_state=self.hidden_state,
                                                                                          attn_mask=self.prefill_outputs["attention_mask"])
+                    
                     self.hidden_state = torch.cat((self.hidden_state, hidden_state[:,-1:,:]), dim=1) # [batch_size, seq_len, hidden_size]
-                    #check end of generation
                     proposed_tokens.append(generated_token)
+    
                     if self.check_end_of_generation(generated_token):
                         self.new_obs = True
                         break
 
-                self.last_tokens = torch.cat(proposed_tokens,dim=-1)
                 self.generated_tokens.extend(proposed_tokens)
-                self.prefill_outputs["input_ids"] = torch.cat([self.prefill_outputs["input_ids"], generated_token], dim = -1)
-                next_attention = torch.ones_like(generated_token, device = generated_token.device)
-                self.prefill_outputs["attention_mask"] = torch.cat([self.prefill_outputs["attention_mask"], next_attention], dim = -1)
+                self.prefill_outputs["input_ids"] = torch.cat([self.prefill_outputs["input_ids"], *proposed_tokens], dim = -1)
+                self.prefill_outputs["attention_mask"] = torch.ones_like(self.prefill_outputs["input_ids"])
             # <SPECULATION INFERENCE STOP>
             
             # decode every new sequence and count amount of spaces 
