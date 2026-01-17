@@ -37,7 +37,7 @@ dataset = LeRobotDataset(DATASET_PATH, delta_timestamps=delta_timestamps)
 dataloader = torch.utils.data.DataLoader(
     dataset,
     num_workers=0,
-    batch_size=8,
+    batch_size=1,
     shuffle=True,
     pin_memory=device.type != "cpu",
     drop_last=True,
@@ -58,11 +58,10 @@ raw_batch = next(dl_iter)
 batch = preprocessor(raw_batch)
 
 # %%
-for step in tqdm(range(50)):
+for step in tqdm(range(100)):
     # batch = {k: (v.to(device) if isinstance(v, torch.Tensor) else v) for k, v in batch.items()}
     loss, loss_dict = policy.forward(batch)
     vlm_loss = loss_dict["vlm_loss"]
-    reg_loss_eagle = loss_dict["reg_loss_eagle"]
     cls_loss_eagle = loss_dict["cls_loss_eagle"]
 
     loss.backward()
@@ -70,7 +69,6 @@ for step in tqdm(range(50)):
     optimizer.zero_grad()
 
     print(f"step: {step} loss: {vlm_loss:.3f}"
-          f" reg_loss_eagle: {reg_loss_eagle:.3f}"
           f" cls_loss_eagle: {cls_loss_eagle:.3f}")
 
 # %% [markdown]
@@ -82,7 +80,6 @@ decoded_actions = postprocessor(decoded_actions)
 
 # %%
 error: torch.tensor = torch.sqrt((decoded_actions.detach().cpu() - raw_batch["action"].detach().cpu()) ** 2)
-
 print(f"RMSE {(error.mean(dim=1)).tolist()}")
 
 
