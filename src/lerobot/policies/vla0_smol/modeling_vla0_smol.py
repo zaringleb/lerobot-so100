@@ -263,8 +263,6 @@ class EagleModel(nn.Module):
                 position_embeddings=position_embeddings,
             )
 
-        hidden_states = self.norm(hidden_states)
-
         return BaseModelOutputWithPast(
             last_hidden_state=hidden_states,
             past_key_values=past_key_values,
@@ -575,6 +573,8 @@ class VLA0(nn.Module):
             # get last hidden layer [bs, seq_len, hidden_dim]
             teacher_output = outputs.hidden_states[-1]
             # teacher hidden state: F_{1:i-1}
+
+            # we remove hidden state for last token because we do not have a next token for it
             teacher_hidden_state = teacher_output[:, :-1, :].detach() # [batch_size, seq_len - 1, hidden_size]
             # input tokens: T_{2:i}
             input_ids = padded_outs["input_ids"][:, 1:] # [batch_size, seq_len - 1]
@@ -594,30 +594,31 @@ class VLA0(nn.Module):
             # regularisation loss
             eagle_hidden_state = eagle_output.last_hidden_state # [batch_size, seq_len - 1, hidden_size]
             # target hifdden state: F_{2:i}
-            target_hidden_state = teacher_output[:, 1:, :].detach() # [batch_size, seq_len - 1, hidden_size]
+            # target_hidden_state = teacher_output[:, 1:, :].detach() # [batch_size, seq_len - 1, hidden_size]
 
-            reg_loss_fct = nn.SmoothL1Loss()
+            # reg_loss_fct = nn.SmoothL1Loss()
 
-            # ?????? should we use loss mask here ?????????
-            reg_loss = reg_loss_fct(eagle_hidden_state, target_hidden_state)
+            # # ?????? should we use loss mask here ?????????
+            # reg_loss = reg_loss_fct(eagle_hidden_state, target_hidden_state)
 
             # classifiaction loss
             eagle_loss_fct = nn.CrossEntropyLoss(reduction="none")
             eagle_logits = self.eagle_model.lm_head(self.eagle_model.norm(eagle_hidden_state))
-            teacher_logits = padded_outs["input_ids"][:, 1:].to(device)
+            teacher_logits = padded_outs["input_ids"][:, 2:].to(device)
             cls_loss = eagle_loss_fct(eagle_logits.reshape(-1, eagle_logits.shape[-1]), teacher_logits.reshape(-1))
             
             # Apply loss mask
+            loss_mask = loss_mask[:, 2:].to(device)  # Ensure correct shape
             cls_loss = cls_loss * loss_mask.reshape(-1)
 
             # Compute final loss
             cls_loss = cls_loss.sum() / torch.clamp(loss_mask.sum(), min=1)
 
-            loss = vlm_loss + reg_loss + 0.1 * cls_loss 
+            loss = vlm_loss + 0.1 * cls_loss #+ reg_loss 
 
             loss_dict = {
                 "vlm_loss": vlm_loss.item(),
-                "reg_loss_eagle": reg_loss.item(),
+                # "reg_loss_eagle": reg_loss.item(),
                 "cls_loss_eagle": cls_loss.item(),
                 "loss": loss,
                 "sequence_len": padded_outs["input_ids"].shape[-1],
