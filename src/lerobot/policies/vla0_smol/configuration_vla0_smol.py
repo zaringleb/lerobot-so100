@@ -18,7 +18,7 @@ class VLA0SmolConfig(PreTrainedConfig):
     ensemble_size: int = 0
     
     use_vllm_client: bool = False
-    vllm_url: str = "http://localhost:8000/v1"
+    vllm_url: str = "http://localhost:8000/"
     vllm_api_key: str = "EMPTY"
 
     normalization_mapping: dict[str, NormalizationMode] = field(

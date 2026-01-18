@@ -1,8 +1,14 @@
 #!/usr/bin/env python
 
+import time
 import logging
 import random
+import requests
+import queue
+import threading
 from collections import deque
+from fastapi import requests
+from typing import AsyncGenerator
 
 import torch
 from torch import Tensor, nn
@@ -13,6 +19,7 @@ from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.policies.vla0_smol.configuration_vla0_smol import VLA0SmolConfig
 from lerobot.utils.constants import ACTION, OBS_STATE
 from lerobot.policies.vla0_smol.monkey_patch import patch_SmolVLM_amp, patch_SmolVLMProcessor
+from lerobot.policies.vla0_smol.temporal_ensembler import VLA0TemporalEnsembler
 
 try:
     from transformers import AutoModelForImageTextToText, AutoProcessor
@@ -43,6 +50,7 @@ PRECISION = {
 }
 
 EPS = 1e-6
+SERVER_PROFILE = False
 
 
 class VLA0SmolPolicy(PreTrainedPolicy):
@@ -72,6 +80,7 @@ class VLA0SmolPolicy(PreTrainedPolicy):
             if not HAS_REMOTE_DEPS:
                 raise ImportError("Please install `openai` and `pillow` for remote inference.")
             self.model = VLA0Client(config)
+            self.service = AsyncInferenceService(self.model)
         else:
             logging.info("VLA0 Policy: Initializing in LOCAL TRAINING mode (PyTorch).")
             if not HAS_LOCAL_DEPS:
@@ -107,41 +116,99 @@ class VLA0SmolPolicy(PreTrainedPolicy):
         """Predict a chunk of actions given environment observations."""
         raise NotImplementedError("Currently not implemented for VLA0")
 
+    # @torch.no_grad()
+    # def select_action(self, batch: dict[str, Tensor]) -> Tensor:
+    #     """Select a single action given environment observations.
+
+    #     This method wraps `select_actions` in order to return one action at a time for execution in the
+    #     environment. It works by managing the actions in a queue and only calling `select_actions` when the
+    #     queue is empty.
+    #     """
+    #     self.eval()
+
+    #     if self.use_ensembling:
+    #         actions = self.model.generate_actions(batch)
+
+    #         original_action_dim = self.config.action_feature.shape[0]
+    #         actions = actions[:, :, :original_action_dim]
+
+    #         return self.temporal_ensembler.update(actions)
+    #     else:
+    #         # Action queue logic for n_action_steps > 1. When the action_queue is depleted, populate it by
+    #         # querying the policy.
+    #         if len(self._action_queue) == 0:
+    #             actions = self.model.generate_actions(batch)
+    #             actions = actions[:, : self.config.n_action_steps]
+
+    #             original_action_dim = self.config.action_feature.shape[0]
+    #             actions = actions[:, :, :original_action_dim]
+    #             # `self.model.forward` returns a (batch_size, n_action_steps, action_dim) tensor, but the queue
+    #             # effectively has shape (n_action_steps, batch_size, *), hence the transpose.
+    #             self._action_queue.extend(actions.transpose(0, 1))
+    #         return self._action_queue.popleft()
+
+    def _handle_simple_action(self, action):
+        self._action_queue.append(action)
+
     @torch.no_grad()
     def select_action(self, batch: dict[str, Tensor]) -> Tensor:
-        """Select a single action given environment observations.
+        if self.config.use_vllm_client:
 
-        This method wraps `select_actions` in order to return one action at a time for execution in the
-        environment. It works by managing the actions in a queue and only calling `select_actions` when the
-        queue is empty.
-        """
-        self.eval()
+            if self.use_ensembling:
+                raise NotImplementedError("Ensemble mode not implemented for vLLM client yet.")
 
-        if self.use_ensembling:
-            actions = self.model.generate_actions(batch)
+            else:
+                if not self._action_queue:
+                    self.service.submit_request(batch, self._handle_simple_action)
 
-            original_action_dim = self.config.action_feature.shape[0]
-            actions = actions[:, :, :original_action_dim]
-
-            return self.temporal_ensembler.update(actions)
+                while not self._action_queue:
+                    time.sleep(0.01)
+                return self._action_queue.popleft()
         else:
-            # Action queue logic for n_action_steps > 1. When the action_queue is depleted, populate it by
-            # querying the policy.
-            if len(self._action_queue) == 0:
-                actions = self.model.generate_actions(batch)
-                actions = actions[:, : self.config.n_action_steps]
-
-                original_action_dim = self.config.action_feature.shape[0]
-                actions = actions[:, :, :original_action_dim]
-                # `self.model.forward` returns a (batch_size, n_action_steps, action_dim) tensor, but the queue
-                # effectively has shape (n_action_steps, batch_size, *), hence the transpose.
-                self._action_queue.extend(actions.transpose(0, 1))
-            return self._action_queue.popleft()
+            raise NotImplementedError("select_action is only implemented for vLLM client mode.")
 
     def forward(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
         loss_dict = self.model.forward(batch)
         loss = loss_dict.pop("loss")
         return loss, loss_dict
+
+
+class AsyncInferenceService:
+    def __init__(self, model_client):
+        self.model = model_client
+        # Queue stores: (batch, callback_function)
+        self.request_queue = queue.Queue(maxsize=1) 
+        self._stop_event = threading.Event()
+        self.thread = threading.Thread(target=self._worker_loop, daemon=True)
+        self.thread.start()
+
+    def submit_request(self, batch, callback):
+        """
+        callback: A function that takes ONE action tensor and saves it.
+        """
+        try:
+            self.request_queue.put_nowait((batch, callback))
+            return True
+        except queue.Full:
+            return False
+
+    def _worker_loop(self):
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
+        while not self._stop_event.is_set():
+            try:
+                batch, callback = self.request_queue.get(timeout=1.0)
+                loop.run_until_complete(self._stream_task(batch, callback))
+            except queue.Empty:
+                continue
+
+    async def _stream_task(self, batch, callback):
+        try:
+            async for action in self.model.stream_actions_async(batch):
+                callback(action) 
+        except Exception as e:
+            logging.error(f"Streaming error: {e}")
 
 
 def get_range_regex(min_val: int, max_val: int) -> str:
@@ -198,50 +265,6 @@ def build_exact_n_numbers_grammar(n_numbers: int, min_val: int, max_val: int) ->
     sequence_rule = "root ::= space " + " space ".join(sequence_parts)
 
     return base_rules + sequence_rule
-
-
-class VLA0TemporalEnsembler:
-    def __init__(self, ensemble_prediction_count: int) -> None:
-        """
-        Implements the specific ensembling logic used in VLA0 Libero evaluation.
-
-        Args:
-            ensemble_prediction_count (int): Corresponds to ensemble_prediction param.
-                This limits how many overlapping schedules are averaged.
-        """
-        self.max_schedules = ensemble_prediction_count
-        self.reset()
-
-    def reset(self):
-        self.schedules = deque(maxlen=self.max_schedules)
-
-    def update(self, new_action_chunk: Tensor) -> Tensor:
-        """
-        Args:
-            new_action_chunk: Tensor of shape (batch, horizon, action_dim).
-                Note: This implementation assumes batch_size=1 for simplicity
-                as per standard eval loops, but can be adapted.
-        """
-        self.schedules.append(new_action_chunk)
-
-        current_actions = []
-        for i, schedule in enumerate(reversed(self.schedules)):
-            # schedule shape: (Batch, Horizon, Action_Dim)
-            horizon_len = schedule.shape[1]
-
-            if i < horizon_len:
-                action_at_step_i = schedule[:, i, :]
-                current_actions.append(action_at_step_i)
-            else:
-                break
-
-        if not current_actions:
-            return new_action_chunk[:, 0, :]
-
-        stacked_actions = torch.stack(current_actions, dim=0)
-        action_to_execute = stacked_actions.mean(dim=0)
-
-        return action_to_execute
 
 
 class VLA0Local(nn.Module):
@@ -625,8 +648,11 @@ class VLA0Client(nn.Module):
         
         bins = torch.linspace(-1.0 - EPS, 1.0 + EPS, self.config.n_state_bins + 1, device=device)
 
+        if SERVER_PROFILE:
+            start_resp = requests.post(f"{self.config.vllm_url}/start_profile")
+
         async with AsyncOpenAI(
-            base_url=self.config.vllm_url,
+            base_url=self.config.vllm_url + "v1",
             api_key=self.config.vllm_api_key,
             max_retries=0, 
             timeout=30.0,
@@ -695,7 +721,84 @@ class VLA0Client(nn.Module):
             tasks = [process_single_sample_async(i) for i in range(batch_size)]
             results = await asyncio.gather(*tasks)
 
-            return torch.stack(results)
+        if SERVER_PROFILE:
+            stop_resp = requests.post(f"{self.config.vllm_url}/stop_profile")
+            exit(0)
+
+        return torch.stack(results)
+
+    async def stream_actions_async(self, batch: dict[str, Tensor]) -> AsyncGenerator[Tensor, None]:
+        """
+        Streams actions one by one as they are generated by the VLM.
+        """
+        device = self.dummy_param.device
+        batch_size = batch[OBS_STATE].shape[0]
+        if batch_size > 1:
+            raise NotImplementedError("Streaming currently supported for batch_size=1 only.")
+
+        bins = torch.linspace(-1.0 - EPS, 1.0 + EPS, self.config.n_state_bins + 1, device=device)
+        bin_centers = 0.5 * (bins[:-1] + bins[1:])
+        
+        state = batch[OBS_STATE][0]
+        disc_state = (torch.bucketize(state, bins[:-1]) - 1).cpu().numpy()
+        state_str = " ".join(map(str, disc_state.tolist()))
+        task_text = batch.get("task", [""])[0]
+        task_cleaned = task_text.lower().strip().replace("_", " ")
+
+        if self.config.use_state:
+            prompt_text = f"Task: {task_cleaned}, State: {state_str}, Actions: "
+        else:
+            prompt_text = f"Task: {task_cleaned}, Actions: "
+
+        content_payload = []
+        present_img_keys = [k for k in self.image_keys if k in batch]
+        for key in present_img_keys:
+            b64_str = self._process_image_to_base64(batch[key][0])
+            content_payload.append({
+                "type": "image_url",
+                "image_url": {"url": f"data:image/png;base64,{b64_str}"}
+            })
+        content_payload.append({"type": "text", "text": prompt_text})
+
+        async with AsyncOpenAI(base_url=self.config.vllm_url + "v1", api_key=self.config.vllm_api_key) as client:
+            stream = await client.chat.completions.create(
+                model=self.model_name,
+                messages=[{"role": "user", "content": content_payload}],
+                max_tokens=self.config.max_decoding_steps,
+                temperature=0.0,
+                extra_body={"guided_grammar": self.grammar_str},
+                stream=True
+            )
+
+            current_buffer = ""
+            found_indices = []
+
+            async for chunk in stream:
+                token = chunk.choices[0].delta.content
+                if not token: continue
+                
+                current_buffer += token
+
+                if " " in current_buffer:
+                    parts = current_buffer.split()
+                    # The last part might be an incomplete number (e.g. "12" of "123")
+                    # unless the token ended with a space.
+                    complete_numbers = parts[:-1] if not current_buffer.endswith(" ") else parts
+                    current_buffer = parts[-1] if not current_buffer.endswith(" ") else ""
+
+                    for num_str in complete_numbers:
+                        if num_str.isdigit():
+                            found_indices.append(int(num_str))
+
+                        # Once we have enough indices for one full action
+                        if len(found_indices) == self.action_dim:
+                            idx_tensor = torch.tensor(found_indices, device=device)
+                            action = bin_centers[idx_tensor]
+                            if self.config.relative_actions:
+                                action = action + state
+
+                            yield action.unsqueeze(0)
+                            found_indices = []
 
     @torch.no_grad()
     def generate_actions(self, batch: dict[str, Tensor]) -> Tensor:
