@@ -199,8 +199,14 @@ class EagleModel(nn.Module):
         hidden_size = self.draft_cfg.hidden_size
         self.fuse_fc = nn.Linear(2 * hidden_size, hidden_size, bias=False)
 
+        self.hidden_states_fuse_fc = nn.Linear(3 * hidden_size, hidden_size)
+
         self.decoder_layer = LlamaDecoderLayer(self.draft_cfg, layer_idx=0)
 
+    def fuse_vlm_hidden_states(self, hidden_states: list):
+        hidden_states = torch.cat(hidden_states, dim = -1)
+        hidden_state_fused = self.hidden_states_fuse_fc(hidden_states)
+        return hidden_state_fused
 
     def forward(self,
                 input_ids,
@@ -562,19 +568,20 @@ class VLA0(nn.Module):
             return loss_dict
 
         with record_function("eagle_forward"):
-            # get last hidden layer [bs, seq_len, hidden_dim]
-            teacher_output = outputs.hidden_states[-1]
-            # teacher hidden state: F_{1:i-1}
+            # get hidden states
+            base_hidden_states = [outputs.hidden_states[id] for id in self.config.eagle_layers_ids]
 
+            # teacher hidden state: F_{1:i-1}
             # we remove hidden state for last token because we do not have a next token for it
-            teacher_hidden_state = teacher_output[:, :-1, :]#.detach() # [batch_size, seq_len - 1, hidden_size]
+            fused_hidden_state = self.eagle_model.fuse_vlm_hidden_states(base_hidden_states)[:, :-1, :] # [batch_size, seq_len - 1, hidden_size]
+
             # input tokens: T_{2:i}
             input_ids = padded_outs["input_ids"][:, 1:] # [batch_size, seq_len - 1]
 
             attn_mask = padded_outs["attention_mask"][:, 1:]  # [batch_size, seq_len - 1]
 
             eagle_output = self.eagle_model(input_ids = input_ids,
-                                            hidden_states = teacher_hidden_state,
+                                            hidden_states = fused_hidden_state,
                                             attention_mask = attn_mask,
                                             position_ids = None,
                                             past_key_values = None,
@@ -686,7 +693,13 @@ class VLA0(nn.Module):
             self.prefill_outputs["attention_mask"] = torch.ones_like(self.prefill_outputs["input_ids"])
             
             if self.config.eagle:
-                self.hidden_state = out.hidden_states[-1] # [batch_size, seq_len, hidden_size]
+                base_hidden_states = [out.hidden_states[id] for id in self.config.eagle_layers_ids]
+
+                # teacher hidden state: F_{1:i-1}
+                # we remove hidden state for last token because we do not have a next token for it
+                fused_hidden_state = self.eagle_model.fuse_vlm_hidden_states(base_hidden_states)
+
+                self.hidden_state = fused_hidden_state # [batch_size, seq_len, hidden_size]
 
             self.generated_tokens.append(generated_token)
 
@@ -707,7 +720,14 @@ class VLA0(nn.Module):
             self.prefill_outputs["attention_mask"] = torch.ones_like(self.prefill_outputs["input_ids"])
 
             if self.config.eagle:
-                self.hidden_state = torch.cat((self.hidden_state, out.hidden_states[-1][:,-1:,:]), dim=1) # [batch_size, seq_len, hidden_size]
+                base_hidden_states = [out.hidden_states[id] for id in self.config.eagle_layers_ids]
+
+                # teacher hidden state: F_{1:i-1}
+                # we remove hidden state for last token because we do not have a next token for it
+                fused_hidden_state = self.eagle_model.fuse_vlm_hidden_states(base_hidden_states)
+                self.hidden_state = fused_hidden_state # [batch_size, seq_len, hidden_size]
+
+                # self.hidden_state = torch.cat((self.hidden_state, out.hidden_states[-1][:,-1:,:]), dim=1) # [batch_size, seq_len, hidden_size]
             
             self.generated_tokens.append(generated_token)
 
