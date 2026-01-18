@@ -63,7 +63,7 @@ class VLA0SmolConfig(PreTrainedConfig):
     action_streaming: bool = False
     eagle: bool = True
     num_spec_tokens: int = 1
-    eagle_layers_ids: list = [1, 17, 30]
+    eagle_layers_ids: tuple[int, int, int] = (1, 17, 30)
 
     # Image crop parameters
     crop_shape: tuple[int, int] | None = None
