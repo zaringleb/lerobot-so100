@@ -184,6 +184,16 @@ class VLA0TemporalEnsembler:
 
         return action_to_execute
 
+@torch.no_grad()
+def padding(tensor, left=True):
+    zeropadding = torch.zeros_like(tensor[:, -1:])
+    if left:
+        tensor = torch.cat((zeropadding, tensor[:, :-1]), dim=1)
+    else:
+        tensor = torch.cat((tensor[:, 1:], zeropadding), dim=1)
+    return tensor
+
+
 class EagleModel(nn.Module):
     def __init__(self, vlm):
         super().__init__()
@@ -259,6 +269,72 @@ class EagleModel(nn.Module):
                 cache_position=cache_position,
                 position_embeddings=position_embeddings,
             )
+
+        return BaseModelOutputWithPast(
+            last_hidden_state=hidden_states,
+            past_key_values=past_key_values,
+        )
+    
+    def train_forward(self,
+                input_ids,
+                hidden_states,
+                attention_mask,
+                position_ids,
+                past_key_values = None,
+                use_cache = False,
+                cache_position = None,
+                ):
+        """
+        input_ids: [B, seq_len]
+        hidden_state: [B, seq_len, hidden_size]
+        attn_maks: [B, seq_len]
+        """
+        hidden_states = torch.cat((hidden_states, inputs_embeds), dim = -1)
+        hidden_states = self.fuse_fc(hidden_states)
+        
+        position_ids: torch.Tensor = torch.arange(0, inputs_embeds.shape[1], device=inputs_embeds.device)
+
+        losses = []
+        prev_len = 0
+        for idx in range(0, 4):
+            inputs_embeds = self.embed(input_ids) # [B, seq_len, hidden_size]
+            inputs_embeds = inputs_embeds.to(hidden_states.device)
+            
+            attention_mask = ...
+            position_embeddings = self.rotary_emb(hidden_states, position_ids)
+
+            hidden_states_out = self.decoder_layer(
+                    hidden_states,
+                    attention_mask=attention_mask,
+                    position_embeddings=position_embeddings,
+                )
+            
+
+            logits = self.lm_head(self.norm(hidden_states_out[:,prev_len:,:]))
+            teacher_logits = input_ids[:, idx:].to(hidden_states.device)
+
+            cls_loss = eagle_loss_fct(logits.reshape(-1, logits.shape[-1]), teacher_logits.reshape(-1))
+            
+            # Apply loss mask
+            loss_mask_eagle = loss_mask[:, idx:].to(hidden_states.device)  # Ensure correct shape
+
+            cls_loss = cls_loss * loss_mask_eagle.reshape(-1)
+            cls_loss = cls_loss.sum() / torch.clamp(loss_mask_eagle.sum(), min=1)
+            losses.append(cls_loss)
+            
+            inputs_embeds = padding(input_ids, left=False)
+
+            new_hidden_states = torch.cat([hidden_states_out, inputs_embeds[:,idx+1:]], dim = -1)
+            new_hidden_states = self.fuse_fc(new_hidden_states)
+
+            new_position_ids = torch.arange(idx+1, inputs_embeds.shape[1], device=inputs_embeds.device)
+
+            prev_len = hidden_states.shape[1]
+            hidden_states = torch.cat([hidden_states, new_hidden_states], dim = 1)
+
+            # check position_ids shape
+            position_ids = torch.cat(position_ids, new_position_ids, dim=0)
+
 
         return BaseModelOutputWithPast(
             last_hidden_state=hidden_states,
