@@ -275,32 +275,47 @@ class EagleModel(nn.Module):
             past_key_values=past_key_values,
         )
     
-    def train_forward(self,
+    def multihead_loss(self,
                 input_ids,
                 hidden_states,
                 attention_mask,
-                position_ids,
-                past_key_values = None,
-                use_cache = False,
-                cache_position = None,
+                loss_mask
                 ):
         """
         input_ids: [B, seq_len]
         hidden_state: [B, seq_len, hidden_size]
         attn_maks: [B, seq_len]
         """
-        hidden_states = torch.cat((hidden_states, inputs_embeds), dim = -1)
-        hidden_states = self.fuse_fc(hidden_states)
-        
-        position_ids: torch.Tensor = torch.arange(0, inputs_embeds.shape[1], device=inputs_embeds.device)
 
+        cache_position: torch.Tensor = torch.arange(0, hidden_states.shape[1], device=hidden_states.device)
+        position_ids = cache_position.unsqueeze(0)
+
+        loss_fct = nn.CrossEntropyLoss(reduction="none")
+
+        input_ids_with_past = input_ids
         losses = []
         prev_len = 0
-        for idx in range(0, 4):
-            inputs_embeds = self.embed(input_ids) # [B, seq_len, hidden_size]
+        for idx in range(0, 1):
+
+            inputs_embeds = self.embed(input_ids_with_past) # [B, seq_len, hidden_size]
             inputs_embeds = inputs_embeds.to(hidden_states.device)
+
+            hidden_states = torch.cat((hidden_states, inputs_embeds), dim = -1)
+            hidden_states = self.fuse_fc(hidden_states)
             
-            attention_mask = ...
+            if idx == 0:
+                attention_mask = create_causal_mask(
+                    config=self.draft_cfg,
+                    input_embeds=inputs_embeds,
+                    attention_mask=attention_mask,
+                    cache_position=cache_position,
+                    past_key_values=None,
+                    position_ids=position_ids,
+                )
+                print(attention_mask.shape)
+            else:
+                attention_mask = attention_mask
+
             position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
             hidden_states_out = self.decoder_layer(
@@ -309,37 +324,34 @@ class EagleModel(nn.Module):
                     position_embeddings=position_embeddings,
                 )
             
+            # we are interested only in latest generated part
+            hidden_states_out = hidden_states_out[:,prev_len:,:]
 
-            logits = self.lm_head(self.norm(hidden_states_out[:,prev_len:,:]))
-            teacher_logits = input_ids[:, idx:].to(hidden_states.device)
+            logits = self.lm_head(self.norm(hidden_states_out[:,:-1,:])) # mb remove few last token if wrong dim
+            teacher_logits = input_ids[:, idx + 1:].to(hidden_states.device)
 
-            cls_loss = eagle_loss_fct(logits.reshape(-1, logits.shape[-1]), teacher_logits.reshape(-1))
+            cls_loss = loss_fct(logits.reshape(-1, logits.shape[-1]), teacher_logits.reshape(-1))
             
             # Apply loss mask
-            loss_mask_eagle = loss_mask[:, idx:].to(hidden_states.device)  # Ensure correct shape
+            loss_mask_eagle = loss_mask[:, idx + 1:].to(hidden_states.device)  # Ensure correct shape
 
             cls_loss = cls_loss * loss_mask_eagle.reshape(-1)
             cls_loss = cls_loss.sum() / torch.clamp(loss_mask_eagle.sum(), min=1)
             losses.append(cls_loss)
-            
-            inputs_embeds = padding(input_ids, left=False)
 
-            new_hidden_states = torch.cat([hidden_states_out, inputs_embeds[:,idx+1:]], dim = -1)
-            new_hidden_states = self.fuse_fc(new_hidden_states)
+            input_ids = padding(input_ids, left=False)
+            loss_mask = padding(loss_mask, left=False)
 
-            new_position_ids = torch.arange(idx+1, inputs_embeds.shape[1], device=inputs_embeds.device)
+            input_ids_with_past = torch.cat([input_ids_with_past, input_ids[:,idx + 1:]])
+
+            new_position_ids = torch.arange(idx + 1, input_ids.shape[1] + idx + 1, device=hidden_states.device)
+            new_position_ids = new_position_ids.unsqueeze(0)
+            position_ids = torch.cat(position_ids, new_position_ids, dim=1)
 
             prev_len = hidden_states.shape[1]
-            hidden_states = torch.cat([hidden_states, new_hidden_states], dim = 1)
+            hidden_states = torch.cat([hidden_states, hidden_states_out], dim = 1)
 
-            # check position_ids shape
-            position_ids = torch.cat(position_ids, new_position_ids, dim=0)
-
-
-        return BaseModelOutputWithPast(
-            last_hidden_state=hidden_states,
-            past_key_values=past_key_values,
-        )
+        return losses
     
     def generate_next_token(self,
                             input_ids,
@@ -651,42 +663,17 @@ class VLA0(nn.Module):
             # we remove hidden state for last token because we do not have a next token for it
             fused_hidden_state = self.eagle_model.fuse_vlm_hidden_states(base_hidden_states)[:, :-1, :] # [batch_size, seq_len - 1, hidden_size]
 
-            # input tokens: T_{2:i}
-            input_ids = padded_outs["input_ids"][:, 1:] # [batch_size, seq_len - 1]
+            losses = self.eagle_model.multihead_loss(input_ids=padded_outs["input_ids"][:, 1:],
+                                                     hidden_states=fused_hidden_state,
+                                                     attention_mask=padded_outs["attention_mask"][:, 1:],
+                                                     loss_mask=loss_mask[:, 1:])
+           
 
-            attn_mask = padded_outs["attention_mask"][:, 1:]  # [batch_size, seq_len - 1]
-
-            eagle_output = self.eagle_model(input_ids = input_ids,
-                                            hidden_states = fused_hidden_state,
-                                            attention_mask = attn_mask,
-                                            position_ids = None,
-                                            past_key_values = None,
-                                            use_cache = False,
-                                            cache_position = None,
-                                            )
-        
-        with record_function("eagle_loss"):
-            eagle_hidden_state = eagle_output.last_hidden_state[:,:-1,:] # [batch_size, seq_len - 1, hidden_size]
-
-            # classifiaction loss
-            eagle_loss_fct = nn.CrossEntropyLoss(reduction="none")
-            eagle_logits = self.eagle_model.lm_head(self.eagle_model.norm(eagle_hidden_state))
-            teacher_logits = padded_outs["input_ids"][:, 2:].to(device)
-
-            cls_loss = eagle_loss_fct(eagle_logits.reshape(-1, eagle_logits.shape[-1]), teacher_logits.reshape(-1))
-            
-            # Apply loss mask
-            loss_mask_eagle = loss_mask[:, 2:].to(device)  # Ensure correct shape
-            cls_loss = cls_loss * loss_mask_eagle.reshape(-1)
-
-            # Compute final loss
-            cls_loss = cls_loss.sum() / torch.clamp(loss_mask_eagle.sum(), min=1)
-
-            loss = vlm_loss + cls_loss
+            loss = vlm_loss + sum(losses)
 
             loss_dict = {
                 "vlm_loss": vlm_loss.item(),
-                "eagle_loss": cls_loss.item(),
+                "eagle_loss": sum(losses).item(),
                 "loss": loss,
                 "sequence_len": padded_outs["input_ids"].shape[-1],
             }
