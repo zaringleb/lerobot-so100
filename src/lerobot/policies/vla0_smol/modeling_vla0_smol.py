@@ -4,6 +4,7 @@ import logging
 import random
 from collections import deque
 import copy
+import time
 
 import torch
 import xgrammar as xgr
@@ -190,14 +191,16 @@ def padding(tensor, left=True):
     if left:
         tensor = torch.cat((zeropadding, tensor[:, :-1]), dim=1)
     else:
-        tensor = torch.cat((tensor[:, 1:], zeropadding), dim=1)
+        tensor = torch.cat((tensor[:, :], zeropadding), dim=1)
     return tensor
 
 
 class EagleModel(nn.Module):
-    def __init__(self, vlm):
+    def __init__(self, vlm, num_spec_tokens):
         super().__init__()
         text_model = vlm.model.text_model
+        self.num_spec_tokens = num_spec_tokens
+
         self.draft_cfg = copy.deepcopy(text_model.config)
 
         self.embed = vlm.get_input_embeddings()
@@ -295,16 +298,17 @@ class EagleModel(nn.Module):
         input_ids_with_past = input_ids
         losses = []
         prev_len = 0
-        for idx in range(0, 1):
+        for idx in range(0, self.num_spec_tokens):
 
             inputs_embeds = self.embed(input_ids_with_past) # [B, seq_len, hidden_size]
             inputs_embeds = inputs_embeds.to(hidden_states.device)
 
+            print(hidden_states.shape, inputs_embeds.shape)
             hidden_states = torch.cat((hidden_states, inputs_embeds), dim = -1)
             hidden_states = self.fuse_fc(hidden_states)
             
             if idx == 0:
-                attention_mask = create_causal_mask(
+                four_d_attention_mask = create_causal_mask(
                     config=self.draft_cfg,
                     input_embeds=inputs_embeds,
                     attention_mask=attention_mask,
@@ -312,15 +316,18 @@ class EagleModel(nn.Module):
                     past_key_values=None,
                     position_ids=position_ids,
                 )
-                print(attention_mask.shape)
+                attention_shape = four_d_attention_mask.shape
             else:
-                attention_mask = attention_mask
+                new_attention_mask = torch.full(attention_shape, False, device=hidden_states.device, dtype=torch.bool)
+                diag = torch.arange(attention_shape[-1], device=hidden_states.device)
+                new_attention_mask[:, :, diag, diag] = True
+                four_d_attention_mask = torch.cat([four_d_attention_mask, new_attention_mask], dim = -1)
 
             position_embeddings = self.rotary_emb(hidden_states, position_ids)
-
+            print(hidden_states.shape, position_ids.shape)
             hidden_states_out = self.decoder_layer(
                     hidden_states,
-                    attention_mask=attention_mask,
+                    attention_mask=four_d_attention_mask,
                     position_embeddings=position_embeddings,
                 )
             
@@ -342,11 +349,11 @@ class EagleModel(nn.Module):
             input_ids = padding(input_ids, left=False)
             loss_mask = padding(loss_mask, left=False)
 
-            input_ids_with_past = torch.cat([input_ids_with_past, input_ids[:,idx + 1:]])
+            input_ids_with_past = torch.cat([input_ids_with_past, input_ids[:,idx + 1:]], dim = 1)
 
-            new_position_ids = torch.arange(idx + 1, input_ids.shape[1] + idx + 1, device=hidden_states.device)
+            new_position_ids = torch.arange(idx + 1, input_ids.shape[1], device=hidden_states.device)
             new_position_ids = new_position_ids.unsqueeze(0)
-            position_ids = torch.cat(position_ids, new_position_ids, dim=1)
+            position_ids = torch.cat([position_ids, new_position_ids], dim=1)
 
             prev_len = hidden_states.shape[1]
             hidden_states = torch.cat([hidden_states, hidden_states_out], dim = 1)
@@ -442,7 +449,7 @@ class VLA0(nn.Module):
 
         # speculation
         if config.eagle:
-            self.eagle_model = EagleModel(self.vlm)
+            self.eagle_model = EagleModel(self.vlm, self.config.num_spec_tokens)
             self.hidden_state = None
             self.prompt = None
             self.prefill_outputs = None
@@ -801,8 +808,6 @@ class VLA0(nn.Module):
             # <SPECULATION INFERNCE START>
             if self.config.eagle:
                 # !!!!!!!!!! as a first step we generate without verification !!!!!!!!!!!!!!!
-
-                proposed_tokens = []
                 for i in range(self.config.num_spec_tokens):
 
                     generated_token, hidden_state = self.eagle_model.generate_next_token(input_ids=self.prefill_outputs["input_ids"][:,1:],
@@ -810,15 +815,14 @@ class VLA0(nn.Module):
                                                                                          attn_mask=self.prefill_outputs["attention_mask"])
                     
                     self.hidden_state = torch.cat((self.hidden_state, hidden_state[:,-1:,:]), dim=1) # [batch_size, seq_len, hidden_size]
-                    proposed_tokens.append(generated_token)
-    
+                    self.prefill_outputs["input_ids"] = torch.cat([self.prefill_outputs["input_ids"], generated_token], dim = -1)
+                    self.prefill_outputs["attention_mask"] = torch.ones_like(self.prefill_outputs["input_ids"])
+                    
+                    self.generated_tokens.append(generated_token)
+
                     if self.check_end_of_generation(generated_token):
                         self.new_obs = True
                         break
-
-                self.generated_tokens.extend(proposed_tokens)
-                self.prefill_outputs["input_ids"] = torch.cat([self.prefill_outputs["input_ids"], *proposed_tokens], dim = -1)
-                self.prefill_outputs["attention_mask"] = torch.ones_like(self.prefill_outputs["input_ids"])
             # <SPECULATION INFERENCE STOP>
             
             # decode every new sequence and count amount of spaces 
