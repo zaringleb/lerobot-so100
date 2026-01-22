@@ -191,7 +191,7 @@ def padding(tensor, left=True):
     if left:
         tensor = torch.cat((zeropadding, tensor[:, :-1]), dim=1)
     else:
-        tensor = torch.cat((tensor[:, :], zeropadding), dim=1)
+        tensor = torch.cat((tensor[1:, :], zeropadding), dim=1)
     return tensor
 
 
@@ -290,57 +290,53 @@ class EagleModel(nn.Module):
         attn_maks: [B, seq_len]
         """
 
-        cache_position: torch.Tensor = torch.arange(0, hidden_states.shape[1], device=hidden_states.device)
-        position_ids = cache_position.unsqueeze(0)
-
         loss_fct = nn.CrossEntropyLoss(reduction="none")
+        past_key_values = DynamicCache(config=self.config)
 
-        input_ids_with_past = input_ids
         losses = []
-        prev_len = 0
         for idx in range(0, self.num_spec_tokens):
 
-            inputs_embeds = self.embed(input_ids_with_past) # [B, seq_len, hidden_size]
-            inputs_embeds = inputs_embeds.to(hidden_states.device)
+            inputs_embeds = self.embed(input_ids) # [B, seq_len, hidden_size]
 
-            print(hidden_states.shape, inputs_embeds.shape)
             hidden_states = torch.cat((hidden_states, inputs_embeds), dim = -1)
             hidden_states = self.fuse_fc(hidden_states)
             
+            position_ids = torch.arange(idx, input_ids.shape[1] + idx, device=hidden_states.device).unsqueeze(0)
+
             if idx == 0:
+                cache_position: torch.Tensor = torch.arange(0, hidden_states.shape[1], device=hidden_states.device)
                 four_d_attention_mask = create_causal_mask(
                     config=self.draft_cfg,
                     input_embeds=inputs_embeds,
                     attention_mask=attention_mask,
                     cache_position=cache_position,
-                    past_key_values=None,
+                    past_key_values=past_key_values,
                     position_ids=position_ids,
                 )
-                attention_shape = four_d_attention_mask.shape
             else:
-                new_attention_mask = torch.full(attention_shape, False, device=hidden_states.device, dtype=torch.bool)
-                diag = torch.arange(attention_shape[-1], device=hidden_states.device)
-                new_attention_mask[:, :, diag, diag] = True
-                four_d_attention_mask = torch.cat([four_d_attention_mask, new_attention_mask], dim = -1)
+                four_d_attention_mask = ...
+                # new_attention_mask = torch.full(attention_shape, False, device=hidden_states.device, dtype=torch.bool)
+                # diag = torch.arange(attention_shape[-1], device=hidden_states.device)
+                # new_attention_mask[:, :, diag, diag] = True
+                # four_d_attention_mask = torch.cat([four_d_attention_mask, new_attention_mask], dim = -1)
 
             position_embeddings = self.rotary_emb(hidden_states, position_ids)
-            print(hidden_states.shape, position_ids.shape)
+
             hidden_states_out = self.decoder_layer(
                     hidden_states,
                     attention_mask=four_d_attention_mask,
                     position_embeddings=position_embeddings,
+                    past_key_values=past_key_values,
+                    use_cache=True,
                 )
-            
-            # we are interested only in latest generated part
-            hidden_states_out = hidden_states_out[:,prev_len:,:]
 
-            logits = self.lm_head(self.norm(hidden_states_out[:,:-1,:])) # mb remove few last token if wrong dim
-            teacher_logits = input_ids[:, idx + 1:].to(hidden_states.device)
+            logits = self.lm_head(self.norm(hidden_states_out))[:,:-1,:]
+            teacher_logits = input_ids[:, 1:].to(hidden_states.device)
 
             cls_loss = loss_fct(logits.reshape(-1, logits.shape[-1]), teacher_logits.reshape(-1))
             
             # Apply loss mask
-            loss_mask_eagle = loss_mask[:, idx + 1:].to(hidden_states.device)  # Ensure correct shape
+            loss_mask_eagle = loss_mask[:, 1:].to(hidden_states.device)  # Ensure correct shape
 
             cls_loss = cls_loss * loss_mask_eagle.reshape(-1)
             cls_loss = cls_loss.sum() / torch.clamp(loss_mask_eagle.sum(), min=1)
@@ -349,14 +345,8 @@ class EagleModel(nn.Module):
             input_ids = padding(input_ids, left=False)
             loss_mask = padding(loss_mask, left=False)
 
-            input_ids_with_past = torch.cat([input_ids_with_past, input_ids[:,idx + 1:]], dim = 1)
+            hidden_states = hidden_states_out
 
-            new_position_ids = torch.arange(idx + 1, input_ids.shape[1], device=hidden_states.device)
-            new_position_ids = new_position_ids.unsqueeze(0)
-            position_ids = torch.cat([position_ids, new_position_ids], dim=1)
-
-            prev_len = hidden_states.shape[1]
-            hidden_states = torch.cat([hidden_states, hidden_states_out], dim = 1)
 
         return losses
     
