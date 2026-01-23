@@ -191,7 +191,7 @@ def padding(tensor, left=True):
     if left:
         tensor = torch.cat((zeropadding, tensor[:, :-1]), dim=1)
     else:
-        tensor = torch.cat((tensor[1:, :], zeropadding), dim=1)
+        tensor = torch.cat((tensor[:, 1:], zeropadding), dim=1)
     return tensor
 
 
@@ -291,7 +291,7 @@ class EagleModel(nn.Module):
         """
 
         loss_fct = nn.CrossEntropyLoss(reduction="none")
-        past_key_values = DynamicCache(config=self.config)
+        past_key_values = DynamicCache(config=self.draft_cfg)
 
         losses = []
         for idx in range(0, self.num_spec_tokens):
@@ -304,21 +304,17 @@ class EagleModel(nn.Module):
             position_ids = torch.arange(idx, input_ids.shape[1] + idx, device=hidden_states.device).unsqueeze(0)
 
             if idx == 0:
-                cache_position: torch.Tensor = torch.arange(0, hidden_states.shape[1], device=hidden_states.device)
-                four_d_attention_mask = create_causal_mask(
-                    config=self.draft_cfg,
-                    input_embeds=inputs_embeds,
-                    attention_mask=attention_mask,
-                    cache_position=cache_position,
-                    past_key_values=past_key_values,
-                    position_ids=position_ids,
-                )
+                batch_size, seq_len = input_ids.shape
+                causal = torch.ones((seq_len, seq_len), dtype=torch.bool, device=hidden_states.device)
+                causal = torch.tril(causal)  # allow attending into past slots
+
+                four_d_attention_mask = causal.unsqueeze(0).unsqueeze(0).expand(batch_size, 1, seq_len, seq_len)
+                attention_shape = four_d_attention_mask.shape
             else:
-                four_d_attention_mask = ...
-                # new_attention_mask = torch.full(attention_shape, False, device=hidden_states.device, dtype=torch.bool)
-                # diag = torch.arange(attention_shape[-1], device=hidden_states.device)
-                # new_attention_mask[:, :, diag, diag] = True
-                # four_d_attention_mask = torch.cat([four_d_attention_mask, new_attention_mask], dim = -1)
+                new_attention_mask = torch.full(attention_shape, False, device=hidden_states.device, dtype=torch.bool)
+                diag = torch.arange(attention_shape[-1], device=hidden_states.device)
+                new_attention_mask[:, :, diag, diag] = True
+                four_d_attention_mask = torch.cat([four_d_attention_mask, new_attention_mask], dim = -1)
 
             position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
@@ -799,7 +795,6 @@ class VLA0(nn.Module):
             if self.config.eagle:
                 # !!!!!!!!!! as a first step we generate without verification !!!!!!!!!!!!!!!
                 for i in range(self.config.num_spec_tokens):
-
                     generated_token, hidden_state = self.eagle_model.generate_next_token(input_ids=self.prefill_outputs["input_ids"][:,1:],
                                                                                          hidden_state=self.hidden_state,
                                                                                          attn_mask=self.prefill_outputs["attention_mask"])
