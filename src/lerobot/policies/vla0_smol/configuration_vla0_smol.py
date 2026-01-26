@@ -61,8 +61,8 @@ class VLA0SmolConfig(PreTrainedConfig):
     action_mask_skip_per: float = 1.0
 
     action_streaming: bool = False
-    eagle: bool = True
-    num_spec_tokens: int = 4
+
+    num_eagle_heads: int = 4
     eagle_layers_ids: tuple[int, int, int] = (1, 17, 30)
 
     # Image crop parameters
