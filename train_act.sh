@@ -1,0 +1,12 @@
+lerobot-train \
+  --dataset.repo_id=southfreebird/lerobot_test_100 \
+  --policy.type=act \
+  --output_dir=outputs/train/act_so101_test_100 \
+  --job_name=act_so101_test \
+  --policy.chunk_size=50 \
+  --policy.n_action_steps=25 \
+  --policy.device=cuda \
+  --wandb.enable=true \
+  --policy.repo_id=southfreebird/my_policy \
+  --steps=500000 \
+  --save_freq=200000
