@@ -231,7 +231,7 @@ class EagleModel(nn.Module):
     def forward(self,
                 input_ids: torch.LongTensor,
                 hidden_states: torch.FloatTensor,
-                attention_mask: torch.Tensor,
+                attention_mask: Optional[torch.Tensor] = None,
                 position_ids: Optional[torch.LongTensor] = None,
                 past_key_values: Optional[Cache] = None,
                 cache_position: Optional[torch.LongTensor] = None,
@@ -345,24 +345,24 @@ class EagleModel(nn.Module):
     def generate_next_token(self,
                             input_ids: torch.LongTensor,
                             hidden_states: torch.FloatTensor,
-                            attention_mask: torch.Tensor,
+                            attention_mask: Optional[torch.Tensor] = None,
                             position_ids: Optional[torch.LongTensor] = None,
                             past_key_values: Optional[Cache] = None,
                             cache_position: Optional[torch.LongTensor] = None,
                             use_cache: Optional[bool] = None,
                 ):
-        output = self.forward(input_ids,
-                              hidden_states,
-                              attention_mask,
-                              position_ids,
-                              past_key_values,
-                              cache_position,
-                              use_cache)
-        logits = self.lm_head(self.norm(output.last_hidden_state)) # [batch_size, seq_len - 1, vocab_size]
+        with torch.inference_mode():
+            output = self.forward(input_ids,
+                                hidden_states,
+                                attention_mask,
+                                position_ids,
+                                past_key_values,
+                                cache_position,
+                                use_cache)
+            logits = self.lm_head(self.norm(output.last_hidden_state)) # [batch_size, seq_len - 1, vocab_size]
         generated_token = logits[:, -1, :].argmax(-1, keepdim=True)
 
-        return generated_token, output.last_hidden_state, output.past_key_values
-
+        return generated_token, output
 
 class VLA0(nn.Module):
     def __init__(self, config: VLA0SmolConfig):
@@ -432,16 +432,18 @@ class VLA0(nn.Module):
         self.last_tokens = None
 
         # multi-token prediction
-        self.train_mtp = True if config.num_eagle_heads > 0 else False
+        self.train_mtp = True if config.num_train_eagle_heads > 0 else False
+        self.inference_mtp = True if config.num_inference_eagle_heads > 0 else False
 
         if self.train_mtp:
             self.train_mtp = True
-            self.eagle_model = EagleModel(num_heads=self.config.num_eagle_heads,
+            self.eagle_model = EagleModel(num_heads=self.config.num_train_eagle_heads,
                                           config=self.vlm.model.text_model.config,
                                           input_embedding=self.vlm.get_input_embeddings(),
                                           output_embedding=self.vlm.get_output_embeddings())
             self.hidden_state = None
-            self.prefill_outputs = None
+            self.input_ids = None
+            self.eagle_past_key_values = None
 
 
     def apply_action_masking(self, actions: list[list[str]]):
@@ -674,7 +676,7 @@ class VLA0(nn.Module):
     def generate_next_token(self,
                             input_ids,
                             past_key_values):
-        with torch.no_grad():
+        with torch.inference_mode():
             out = self.vlm(input_ids=input_ids,
                            past_key_values=past_key_values,
                            output_hidden_states=True,
@@ -724,32 +726,32 @@ class VLA0(nn.Module):
 
             images = self.prepare_images(batch)
 
-            # Prepare inputs directly on GPU
             padded_outs, _ = self.create_input_tokens(
                 states=self.generation_batch[OBS_STATE],
                 images=images,
                 lang_text=self.generation_batch.get("task", ""),
                 actions=None,
             )
-            self.prefill_outputs = padded_outs
+            self.input_ids = padded_outs["input_ids"][:,1:]
 
             self.generated_tokens = []
             self.finish_generation = [False]*batch_size
             self.num_actions_generated = [0]*batch_size
             self.action_index = 0
 
-            # ---- PREFILL AND FIRST TOKEN----
             with torch.inference_mode():
                 out = self.vlm(**padded_outs,
-                               use_cache=False,
+                               use_cache=True,
                                output_hidden_states=True)
 
-            generated_token = out.logits[:, -1, :].argmax(-1, keepdim=True) # [batch_size, 1]
+            generated_token = out.logits[:, -1, :].argmax(-1, keepdim=True)
 
-            self.prefill_outputs["input_ids"] = torch.cat([self.prefill_outputs["input_ids"], generated_token], dim = -1)
-            self.prefill_outputs["attention_mask"] = torch.ones_like(self.prefill_outputs["input_ids"])
+            self.last_tokens = generated_token
+            self.past_key_values = out.past_key_values
+
+            self.input_ids = torch.cat([self.input_ids, generated_token], dim = -1)
             
-            if self.train_mtp:
+            if self.inference_mtp:
                 base_hidden_states = [out.hidden_states[id] for id in self.config.eagle_layers_ids]
                 fused_hidden_state = self.eagle_model.fuse_base_model_hidden_states(base_hidden_states)
                 self.hidden_state = fused_hidden_state
@@ -762,46 +764,40 @@ class VLA0(nn.Module):
         # generate one action
         num_remained_tokens = self.config.max_decoding_steps - len(self.generated_tokens)
         for _ in range(num_remained_tokens):
-            with torch.inference_mode():
-                out = self.vlm(**self.prefill_outputs,
-                               use_cache=False,
-                               output_hidden_states=True)
+            generated_token, out = self.generate_next_token(input_ids=self.last_tokens,
+                                                            past_key_values=self.past_key_values)
 
-            generated_token = out.logits[:, -1, :].argmax(-1, keepdim=True) # [batch_size, 1]
+            self.last_tokens = [generated_token]
+            self.generated_tokens.append(generated_token)
 
-            self.prefill_outputs["input_ids"] = torch.cat([self.prefill_outputs["input_ids"], generated_token], dim = -1)
-            self.prefill_outputs["attention_mask"] = torch.ones_like(self.prefill_outputs["input_ids"])
+            self.past_key_values = out.past_key_values
+            self.input_ids = torch.cat([self.input_ids, generated_token], dim = -1)
 
-            if self.train_mtp > 0:
+            if self.inference_mtp:
                 base_hidden_states = [out.hidden_states[id] for id in self.config.eagle_layers_ids]
 
-                # teacher hidden state: F_{1:i-1}
-                # we remove hidden state for last token because we do not have a next token for it
                 fused_hidden_state = self.eagle_model.fuse_base_model_hidden_states(base_hidden_states)
-                self.hidden_state = fused_hidden_state # [batch_size, seq_len, hidden_size]
-
-                # self.hidden_state = torch.cat((self.hidden_state, out.hidden_states[-1][:,-1:,:]), dim=1) # [batch_size, seq_len, hidden_size]
-            
-            self.generated_tokens.append(generated_token)
+                self.hidden_state = torch.cat([self.hidden_state, fused_hidden_state], dim = 1)           
 
             #check end of generation
             if self.check_end_of_generation(generated_token):
                 self.new_obs = True
-
-            for i in range(self.config.num_eagle_heads):
-                generated_token, hidden_state = self.eagle_model.generate_next_token(input_ids=self.prefill_outputs["input_ids"][:,1:],
-                                                                                     hidden_state=self.hidden_state,
-                                                                                     attn_mask=self.prefill_outputs["attention_mask"])
+            ealge_hidden_state = self.hidden_state
+            for i in range(self.config.num_inference_eagle_heads):
+                generated_token, out = self.eagle_model.generate_next_token(input_ids=self.input_ids,
+                                                                            hidden_states=ealge_hidden_state,
+                                                                            )
                 
-                self.hidden_state = torch.cat((self.hidden_state, hidden_state[:,-1:,:]), dim=1) # [batch_size, seq_len, hidden_size]
-                self.prefill_outputs["input_ids"] = torch.cat([self.prefill_outputs["input_ids"], generated_token], dim = -1)
-                self.prefill_outputs["attention_mask"] = torch.ones_like(self.prefill_outputs["input_ids"])
+                ealge_hidden_state = torch.cat((ealge_hidden_state, out.last_hidden_state[:,-1:,:]), dim=1) # [batch_size, seq_len, hidden_size]
+                self.input_ids = torch.cat([self.input_ids, generated_token], dim = -1)
                 
                 self.generated_tokens.append(generated_token)
-
+                self.last_tokens.append(generated_token)
                 if self.check_end_of_generation(generated_token):
                     self.new_obs = True
                     break
+    
+            self.last_tokens = torch.cat(self.last_tokens, dim=-1)
             
             # decode every new sequence and count amount of spaces 
             tokens_pt = torch.cat(self.generated_tokens,dim=-1)
