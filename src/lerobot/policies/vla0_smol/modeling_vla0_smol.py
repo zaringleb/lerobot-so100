@@ -4,7 +4,7 @@ import logging
 import random
 from collections import deque
 from typing import Optional
-
+import copy
 import torch
 import xgrammar as xgr
 from torch import Tensor, nn
@@ -201,7 +201,8 @@ class EagleModel(nn.Module):
                  output_embedding: nn.Module):
         super().__init__()
         self.num_heads = num_heads
-        self.cfg = config
+        self.cfg = copy.deepcopy(config)
+        self.cfg.num_hidden_layers=1
 
         self.embed_tokens = input_embedding
         self.lm_head = output_embedding
@@ -444,6 +445,7 @@ class VLA0(nn.Module):
             self.hidden_state = None
             self.input_ids = None
             self.eagle_past_key_values = None
+            self.eagle_base_past_key_values = None
 
 
     def apply_action_masking(self, actions: list[list[str]]):
@@ -734,6 +736,9 @@ class VLA0(nn.Module):
             )
             self.input_ids = padded_outs["input_ids"][:,1:]
 
+            self.eagle_past_key_values = DynamicCache(config=self.eagle_model.cfg)
+            self.eagle_base_past_key_values = DynamicCache(config=self.eagle_model.cfg)
+
             self.generated_tokens = []
             self.finish_generation = [False]*batch_size
             self.num_actions_generated = [0]*batch_size
@@ -770,7 +775,6 @@ class VLA0(nn.Module):
             self.last_tokens = [generated_token]
             self.generated_tokens.append(generated_token)
 
-            self.past_key_values = out.past_key_values
             self.input_ids = torch.cat([self.input_ids, generated_token], dim = -1)
 
             if self.inference_mtp:
@@ -782,14 +786,25 @@ class VLA0(nn.Module):
             #check end of generation
             if self.check_end_of_generation(generated_token):
                 self.new_obs = True
-            ealge_hidden_state = self.hidden_state
-            for i in range(self.config.num_inference_eagle_heads):
-                generated_token, out = self.eagle_model.generate_next_token(input_ids=self.input_ids,
-                                                                            hidden_states=ealge_hidden_state,
-                                                                            )
-                
-                ealge_hidden_state = torch.cat((ealge_hidden_state, out.last_hidden_state[:,-1:,:]), dim=1) # [batch_size, seq_len, hidden_size]
-                self.input_ids = torch.cat([self.input_ids, generated_token], dim = -1)
+
+            for head_id in range(self.config.num_inference_eagle_heads):
+                if head_id == 0:
+                    generated_token, out = self.eagle_model.generate_next_token(input_ids=self.input_ids,
+                                                                                hidden_states=self.hidden_state,
+                                                                                past_key_values = self.eagle_base_past_key_values
+                                                                                )
+                    self.eagle_past_key_values = Cache(layers=[copy.copy(layer) for layer in self.eagle_base_past_key_values.layers])
+                    self.input_ids = generated_token
+                else:
+                    generated_token, out = self.eagle_model.generate_next_token(input_ids=generated_token,
+                                                                                hidden_states=out.last_hidden_state[:,-1:,:],
+                                                                                past_key_values = self.eagle_past_key_values
+                                                                                )
+                    self.hidden_state = torch.empty((batch_size,0,self.hidden_state.shape[2]),
+                                                    dtype=self.hidden_state.dtype,
+                                                    device=self.hidden_state.device)
+                    # ealge_hidden_state = torch.cat((ealge_hidden_state, out.last_hidden_state[:,-1:,:]), dim=1) # [batch_size, seq_len, hidden_size]
+                    self.input_ids = torch.cat([self.input_ids, generated_token], dim = -1)
                 
                 self.generated_tokens.append(generated_token)
                 self.last_tokens.append(generated_token)
