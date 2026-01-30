@@ -426,8 +426,7 @@ class VLA0(nn.Module):
         self.new_obs = True
         self.past_key_values = None
         self.generated_tokens = None
-        self.finish_generation = None
-        self.num_actions_generated = None
+        self.generation_finished = None
         self.action_index = 0
         self.generation_batch = None
         self.last_tokens = None
@@ -445,7 +444,6 @@ class VLA0(nn.Module):
             self.hidden_state = None
             self.input_ids = None
             self.eagle_past_key_values = None
-            self.eagle_base_past_key_values = None
 
 
     def apply_action_masking(self, actions: list[list[str]]):
@@ -690,12 +688,12 @@ class VLA0(nn.Module):
         if generated_token is not None:
             batch_size = generated_token.shape[0]
             for i in range(batch_size):
-                if self.finish_generation[i]:
+                if self.generation_finished[i]:
                     generated_token[i, 0] = self.pad_token_id
                 elif generated_token[i, 0] == self.eos_token_id or generated_token[i, 0] == self.pad_token_id:
-                    self.finish_generation[i] = True
+                    self.generation_finished[i] = True
 
-        if sum(self.finish_generation) == len(self.finish_generation):
+        if sum(self.generation_finished) == len(self.generation_finished):
             return True
         return False
 
@@ -718,48 +716,49 @@ class VLA0(nn.Module):
         
         return reconstructed_actions
 
+    def prefill(self, batch):
+        images = self.prepare_images(batch)
+
+        padded_outs, _ = self.create_input_tokens(
+            states=batch[OBS_STATE],
+            images=images,
+            lang_text=batch.get("task", ""),
+            actions=None,
+        )
+        self.input_ids = padded_outs["input_ids"][:,1:]
+
+        with torch.inference_mode():
+            out = self.vlm(**padded_outs,
+                           use_cache=True,
+                           output_hidden_states=True)
+
+        generated_token = out.logits[:, -1, :].argmax(-1, keepdim=True)
+        return generated_token, out
+        
     def generate_one_action(self, batch):
-        device = next(self.vlm.parameters()).device
+        device = batch[OBS_STATE].device
         batch_size = batch[OBS_STATE].shape[0]
 
         if self.new_obs:
             self.new_obs = False
+
+            #initialise new chunck generation
             self.generation_batch = batch
-
-            images = self.prepare_images(batch)
-
-            padded_outs, _ = self.create_input_tokens(
-                states=self.generation_batch[OBS_STATE],
-                images=images,
-                lang_text=self.generation_batch.get("task", ""),
-                actions=None,
-            )
-            self.input_ids = padded_outs["input_ids"][:,1:]
-
-            self.eagle_past_key_values = DynamicCache(config=self.eagle_model.cfg)
-            self.eagle_base_past_key_values = DynamicCache(config=self.eagle_model.cfg)
-
             self.generated_tokens = []
-            self.finish_generation = [False]*batch_size
-            self.num_actions_generated = [0]*batch_size
+            self.generation_finished = [False]*batch_size
             self.action_index = 0
 
-            with torch.inference_mode():
-                out = self.vlm(**padded_outs,
-                               use_cache=True,
-                               output_hidden_states=True)
-
-            generated_token = out.logits[:, -1, :].argmax(-1, keepdim=True)
-
+            #prefill
+            generated_token, output = self.prefill(batch=batch)
             self.last_tokens = generated_token
             self.past_key_values = out.past_key_values
 
             self.input_ids = torch.cat([self.input_ids, generated_token], dim = -1)
             
             if self.inference_mtp:
+                self.eagle_past_key_values = DynamicCache(config=self.eagle_model.cfg)
                 base_hidden_states = [out.hidden_states[id] for id in self.config.eagle_layers_ids]
-                fused_hidden_state = self.eagle_model.fuse_base_model_hidden_states(base_hidden_states)
-                self.hidden_state = fused_hidden_state
+                self.hidden_state = self.eagle_model.fuse_base_model_hidden_states(base_hidden_states)
 
             self.generated_tokens.append(generated_token)
 
@@ -779,11 +778,11 @@ class VLA0(nn.Module):
 
             if self.inference_mtp:
                 base_hidden_states = [out.hidden_states[id] for id in self.config.eagle_layers_ids]
-
                 fused_hidden_state = self.eagle_model.fuse_base_model_hidden_states(base_hidden_states)
                 self.hidden_state = torch.cat([self.hidden_state, fused_hidden_state], dim = 1)           
 
             #check end of generation
+            # do I need check end of generation ?
             if self.check_end_of_generation(generated_token):
                 self.new_obs = True
 
@@ -791,23 +790,24 @@ class VLA0(nn.Module):
                 if head_id == 0:
                     generated_token, out = self.eagle_model.generate_next_token(input_ids=self.input_ids,
                                                                                 hidden_states=self.hidden_state,
-                                                                                past_key_values = self.eagle_base_past_key_values
+                                                                                past_key_values = self.eagle_past_key_values
                                                                                 )
-                    self.eagle_past_key_values = Cache(layers=[copy.copy(layer) for layer in self.eagle_base_past_key_values.layers])
+                    local_eagle_past_key_values = Cache(layers=[copy.copy(layer) for layer in self.eagle_past_key_values.layers])
                     self.input_ids = generated_token
                 else:
                     generated_token, out = self.eagle_model.generate_next_token(input_ids=generated_token,
                                                                                 hidden_states=out.last_hidden_state[:,-1:,:],
-                                                                                past_key_values = self.eagle_past_key_values
+                                                                                past_key_values = local_eagle_past_key_values
                                                                                 )
                     self.hidden_state = torch.empty((batch_size,0,self.hidden_state.shape[2]),
                                                     dtype=self.hidden_state.dtype,
                                                     device=self.hidden_state.device)
-                    # ealge_hidden_state = torch.cat((ealge_hidden_state, out.last_hidden_state[:,-1:,:]), dim=1) # [batch_size, seq_len, hidden_size]
                     self.input_ids = torch.cat([self.input_ids, generated_token], dim = -1)
                 
                 self.generated_tokens.append(generated_token)
                 self.last_tokens.append(generated_token)
+            # do I need check end of generation ?
+
                 if self.check_end_of_generation(generated_token):
                     self.new_obs = True
                     break
@@ -816,8 +816,8 @@ class VLA0(nn.Module):
             
             # decode every new sequence and count amount of spaces 
             tokens_pt = torch.cat(self.generated_tokens,dim=-1)
+
             decoded_texts = self.processor.batch_decode(tokens_pt, skip_special_tokens=True) # return list of lists
-            # print(decoded_texts)
             for i in range(batch_size):
                 if next_action_is_generated[i]:
                     continue
@@ -825,22 +825,23 @@ class VLA0(nn.Module):
                 output = decoded_texts[i].strip().split()
 
                 # if output is invalid just add zeros
-                n_bins = self.config.n_state_bins
-                if not all(a.isdigit() and 0 <= int(a) < n_bins for a in output):
+                if not all(a.isdigit() and 0 <= int(a) < self.config.n_state_bins for a in output):
                     next_action_is_generated[i] = True
                     decoded_actions[i] = torch.zeros(self.action_dim, device=device, dtype=torch.long)
+
                 # check if we finished next action generation
-                if self.finish_generation[i] or len(output) > self.action_dim*(self.action_index + 1):
+                # Do we need generation finished?
+                if self.generation_finished[i] or len(output) > self.action_dim*(self.action_index + 1):
                     next_action_is_generated[i] = True
                     action_text = output[self.action_dim*(self.action_index):self.action_dim*(self.action_index + 1)]
                     decoded_actions[i] = torch.tensor([int(a) for a in action_text], device=device)
-                
+            
             if sum(next_action_is_generated) == len(next_action_is_generated):
                 self.action_index += 1
                 if self.action_index == self.config.n_action_steps:
                     self.new_obs = True
                 return self.reconstruct_actions(decoded_actions, self.generation_batch)
-        # if we did not get 
+
         return torch.zeros((batch_size, 1, self.action_dim), device=device, dtype=torch.long)
 
     def generate_actions(self, batch: dict[str, torch.Tensor]):
